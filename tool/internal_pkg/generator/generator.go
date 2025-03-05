@@ -27,6 +27,7 @@ import (
 	"github.com/cloudwego/kitex/tool/internal_pkg/log"
 	"github.com/cloudwego/kitex/tool/internal_pkg/tpl"
 	"github.com/cloudwego/kitex/tool/internal_pkg/util"
+	"github.com/cloudwego/kitex/transport"
 )
 
 // Constants .
@@ -36,15 +37,21 @@ const (
 
 	BuildFileName       = "build.sh"
 	BootstrapFileName   = "bootstrap.sh"
-	ToolVersionFileName = "kitex.yaml"
+	ToolVersionFileName = "kitex_info.yaml"
 	HandlerFileName     = "handler.go"
 	MainFileName        = "main.go"
 	ClientFileName      = "client.go"
 	ServerFileName      = "server.go"
 	InvokerFileName     = "invoker.go"
 	ServiceFileName     = "*service.go"
+	ExtensionFilename   = "extensions.yaml"
 
 	DefaultThriftPluginTimeLimit = time.Minute
+
+	// built in tpls
+	MultipleServicesTpl = "multiple_services"
+
+	streamxTTHeaderRef = "ttstream"
 )
 
 var (
@@ -52,11 +59,12 @@ var (
 
 	globalMiddlewares  []Middleware
 	globalDependencies = map[string]string{
-		"kitex":   kitexImportPath,
-		"client":  ImportPathTo("client"),
-		"server":  ImportPathTo("server"),
-		"callopt": ImportPathTo("client/callopt"),
-		"frugal":  "github.com/cloudwego/frugal",
+		"kitex":     kitexImportPath,
+		"client":    ImportPathTo("client"),
+		"server":    ImportPathTo("server"),
+		"callopt":   ImportPathTo("client/callopt"),
+		"frugal":    "github.com/cloudwego/frugal",
+		"fieldmask": "github.com/cloudwego/thriftgo/fieldmask",
 	}
 )
 
@@ -71,7 +79,7 @@ func SetKitexImportPath(path string) {
 
 // ImportPathTo returns an import path to the specified package under kitex.
 func ImportPathTo(pkg string) string {
-	return filepath.Join(kitexImportPath, pkg)
+	return util.JoinPath(kitexImportPath, pkg)
 }
 
 // AddGlobalMiddleware adds middleware for all generators
@@ -92,6 +100,7 @@ func AddGlobalDependency(ref, path string) bool {
 type Generator interface {
 	GenerateService(pkg *PackageInfo) ([]*File, error)
 	GenerateMainPackage(pkg *PackageInfo) ([]*File, error)
+	GenerateCustomPackage(pkg *PackageInfo) ([]*File, error)
 }
 
 // Config .
@@ -108,21 +117,42 @@ type Config struct {
 	Includes              util.StringSlice
 	ThriftOptions         util.StringSlice
 	ProtobufOptions       util.StringSlice
+	Hessian2Options       util.StringSlice
 	IDL                   string // the IDL file passed on the command line
 	OutputPath            string // the output path for main pkg and kitex_gen
 	PackagePrefix         string
 	CombineService        bool // combine services to one service
 	CopyIDL               bool
 	ThriftPlugins         util.StringSlice
+	ProtobufPlugins       util.StringSlice
 	Features              []feature
 	FrugalPretouch        bool
 	ThriftPluginTimeLimit time.Duration
+	CompilerPath          string // specify the path of thriftgo or protoc
 
 	ExtensionFile string
 	tmplExt       *TemplateExtension
 
 	Record    bool
 	RecordCmd []string
+
+	TemplateDir string
+
+	GenPath string
+
+	DeepCopyAPI           bool
+	Protocol              string
+	HandlerReturnKeepResp bool
+
+	NoDependencyCheck bool
+	Rapid             bool
+	LocalThriftgo     bool
+
+	FrugalStruct util.StringSlice
+	NoRecurse    bool
+
+	BuiltinTpl util.StringSlice // specify the built-in template to use
+	StreamX    bool
 }
 
 // Pack packs the Config into a slice of "key=val" strings.
@@ -232,13 +262,29 @@ func (c *Config) AddFeature(key string) bool {
 
 // ApplyExtension applies template extension.
 func (c *Config) ApplyExtension() error {
-	if c.ExtensionFile == "" {
+	templateExtExist := false
+	path := util.JoinPath(c.TemplateDir, ExtensionFilename)
+	if c.TemplateDir != "" && util.Exists(path) {
+		templateExtExist = true
+	}
+
+	if c.ExtensionFile == "" && !templateExtExist {
 		return nil
 	}
 
 	ext := new(TemplateExtension)
-	if err := ext.FromJSONFile(c.ExtensionFile); err != nil {
-		return fmt.Errorf("read template extension %q failed: %s", c.ExtensionFile, err.Error())
+	if c.ExtensionFile != "" {
+		if err := ext.FromYAMLFile(c.ExtensionFile); err != nil {
+			return fmt.Errorf("read template extension %q failed: %s", c.ExtensionFile, err.Error())
+		}
+	}
+
+	if templateExtExist {
+		yamlExt := new(TemplateExtension)
+		if err := yamlExt.FromYAMLFile(path); err != nil {
+			return fmt.Errorf("read template extension %q failed: %s", path, err.Error())
+		}
+		ext.Merge(yamlExt)
 	}
 
 	for _, fn := range ext.FeatureNames {
@@ -253,6 +299,15 @@ func (c *Config) ApplyExtension() error {
 
 	c.tmplExt = ext
 	return nil
+}
+
+func (c *Config) IsUsingMultipleServicesTpl() bool {
+	for _, part := range c.BuiltinTpl {
+		if part == MultipleServicesTpl {
+			return true
+		}
+	}
+	return false
 }
 
 // NewGenerator .
@@ -289,30 +344,39 @@ func (g *generator) GenerateMainPackage(pkg *PackageInfo) (fs []*File, err error
 	tasks := []*Task{
 		{
 			Name: BuildFileName,
-			Path: filepath.Join(g.OutputPath, BuildFileName),
+			Path: util.JoinPath(g.OutputPath, BuildFileName),
 			Text: tpl.BuildTpl,
 		},
 		{
 			Name: BootstrapFileName,
-			Path: filepath.Join(g.OutputPath, "script", BootstrapFileName),
+			Path: util.JoinPath(g.OutputPath, "script", BootstrapFileName),
 			Text: tpl.BootstrapTpl,
 		},
 		{
 			Name: ToolVersionFileName,
-			Path: filepath.Join(g.OutputPath, ToolVersionFileName),
+			Path: util.JoinPath(g.OutputPath, ToolVersionFileName),
 			Text: tpl.ToolVersionTpl,
 		},
 	}
 	if !g.Config.GenerateInvoker {
-		tasks = append(tasks, &Task{
-			Name: MainFileName,
-			Path: filepath.Join(g.OutputPath, MainFileName),
-			Text: tpl.MainTpl,
-		})
+		if !g.Config.IsUsingMultipleServicesTpl() {
+			tasks = append(tasks, &Task{
+				Name: MainFileName,
+				Path: util.JoinPath(g.OutputPath, MainFileName),
+				Text: tpl.MainTpl,
+			})
+		} else {
+			// using multiple services main.go template
+			tasks = append(tasks, &Task{
+				Name: MainFileName,
+				Path: util.JoinPath(g.OutputPath, MainFileName),
+				Text: tpl.MainMultipleServicesTpl,
+			})
+		}
 	}
 	for _, t := range tasks {
 		if util.Exists(t.Path) {
-			log.Info(t.Path, "exists. Skipped.")
+			log.Debug(t.Path, "exists. Skipped.")
 			continue
 		}
 		g.setImports(t.Name, pkg)
@@ -326,76 +390,101 @@ func (g *generator) GenerateMainPackage(pkg *PackageInfo) (fs []*File, err error
 		fs = append(fs, f)
 	}
 
-	handlerFilePath := filepath.Join(g.OutputPath, HandlerFileName)
-	if util.Exists(handlerFilePath) {
-		comp := newCompleter(
-			pkg.ServiceInfo.AllMethods(),
-			handlerFilePath,
-			pkg.ServiceInfo.ServiceName)
-		f, err := comp.CompleteMethods()
+	if !g.Config.IsUsingMultipleServicesTpl() {
+		f, err := g.generateHandler(pkg, pkg.ServiceInfo, HandlerFileName)
 		if err != nil {
-			if err == errNoNewMethod {
-				return fs, nil
-			}
 			return nil, err
 		}
-		fs = append(fs, f)
+		// when there is no new method, f would be nil
+		if f != nil {
+			fs = append(fs, f)
+		}
 	} else {
-		task := Task{
-			Name: HandlerFileName,
-			Path: handlerFilePath,
-			Text: tpl.HandlerTpl + "\n" + tpl.HandlerMethodsTpl,
+		for _, svc := range pkg.Services {
+			// set the target service
+			pkg.ServiceInfo = svc
+			handlerFileName := "handler_" + svc.ServiceName + ".go"
+			f, err := g.generateHandler(pkg, svc, handlerFileName)
+			if err != nil {
+				return nil, err
+			}
+			// when there is no new method, f would be nil
+			if f != nil {
+				fs = append(fs, f)
+			}
 		}
-		g.setImports(task.Name, pkg)
-		handle := func(task *Task, pkg *PackageInfo) (*File, error) {
-			return task.Render(pkg)
-		}
-		f, err := g.chainMWs(handle)(&task, pkg)
-		if err != nil {
-			return nil, err
-		}
-		fs = append(fs, f)
 	}
 	return
 }
 
+// generateHandler generates the handler file based on the pkg and the target service
+func (g *generator) generateHandler(pkg *PackageInfo, svc *ServiceInfo, handlerFileName string) (*File, error) {
+	handlerFilePath := filepath.Join(g.OutputPath, handlerFileName)
+	if util.Exists(handlerFilePath) {
+		comp := newCompleter(
+			svc.AllMethods(),
+			handlerFilePath,
+			svc.ServiceName)
+		f, err := comp.CompleteMethods()
+		if err != nil && err != errNoNewMethod {
+			return nil, err
+		}
+		return f, nil
+	}
+
+	task := Task{
+		Name: HandlerFileName,
+		Path: handlerFilePath,
+		Text: tpl.HandlerTpl + "\n" + tpl.HandlerMethodsTpl,
+	}
+	g.setImports(task.Name, pkg)
+	handle := func(task *Task, pkg *PackageInfo) (*File, error) {
+		return task.Render(pkg)
+	}
+	f, err := g.chainMWs(handle)(&task, pkg)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
 func (g *generator) GenerateService(pkg *PackageInfo) ([]*File, error) {
 	g.updatePackageInfo(pkg)
-	output := filepath.Join(g.OutputPath, KitexGenPath)
-	if pkg.Namespace != "" {
-		output = filepath.Join(output, strings.ReplaceAll(pkg.Namespace, ".", "/"))
-	}
+	output := util.JoinPath(g.OutputPath, util.CombineOutputPath(g.GenPath, pkg.Namespace))
 	svcPkg := strings.ToLower(pkg.ServiceName)
-	output = filepath.Join(output, svcPkg)
+	output = util.JoinPath(output, svcPkg)
 	ext := g.tmplExt
 	if ext == nil {
 		ext = new(TemplateExtension)
 	}
 
-	tasks := []*Task{
-		{
-			Name: ClientFileName,
-			Path: filepath.Join(output, ClientFileName),
-			Text: tpl.ClientTpl,
-			Ext:  ext.ExtendClient,
-		},
-		{
-			Name: ServerFileName,
-			Path: filepath.Join(output, ServerFileName),
-			Text: tpl.ServerTpl,
-			Ext:  ext.ExtendServer,
-		},
-		{
+	cliTask := &Task{
+		Name: ClientFileName,
+		Path: util.JoinPath(output, ClientFileName),
+		Text: tpl.ClientTpl,
+		Ext:  ext.ExtendClient,
+	}
+	svrTask := &Task{
+		Name: ServerFileName,
+		Path: util.JoinPath(output, ServerFileName),
+		Text: tpl.ServerTpl,
+		Ext:  ext.ExtendServer,
+	}
+	svcTask := &Task{
+		Name: ServiceFileName,
+		Path: util.JoinPath(output, svcPkg+".go"),
+		Text: tpl.ServiceTpl,
+	}
+	tasks := []*Task{cliTask, svrTask, svcTask}
+
+	// do not generate invoker.go in service package by default
+	if g.Config.GenerateInvoker {
+		tasks = append(tasks, &Task{
 			Name: InvokerFileName,
-			Path: filepath.Join(output, InvokerFileName),
+			Path: util.JoinPath(output, InvokerFileName),
 			Text: tpl.InvokerTpl,
 			Ext:  ext.ExtendInvoker,
-		},
-		{
-			Name: ServiceFileName,
-			Path: filepath.Join(output, svcPkg+".go"),
-			Text: tpl.ServiceTpl,
-		},
+		})
 	}
 
 	var fs []*File
@@ -433,6 +522,13 @@ func (g *generator) updatePackageInfo(pkg *PackageInfo) {
 	pkg.Features = g.Features
 	pkg.ExternalKitexGen = g.Use
 	pkg.FrugalPretouch = g.FrugalPretouch
+	pkg.Module = g.ModuleName
+	if strings.EqualFold(g.Protocol, transport.HESSIAN2.String()) {
+		pkg.Protocol = transport.HESSIAN2
+	}
+	if strings.EqualFold(g.Protocol, transport.TTHeader.String()) {
+		pkg.Protocol = transport.TTHeader
+	}
 	if pkg.Dependencies == nil {
 		pkg.Dependencies = make(map[string]string)
 	}
@@ -450,18 +546,31 @@ func (g *generator) setImports(name string, pkg *PackageInfo) {
 	case ClientFileName:
 		pkg.AddImports("client")
 		if pkg.HasStreaming {
-			pkg.AddImport("streaming", ImportPathTo("pkg/streaming"))
-			pkg.AddImport("transport", ImportPathTo("transport"))
+			if !g.StreamX {
+				pkg.AddImport("streaming", "github.com/cloudwego/kitex/pkg/streaming")
+				pkg.AddImport("transport", "github.com/cloudwego/kitex/transport")
+			} else {
+				pkg.AddImports("github.com/cloudwego/kitex/client/streamxclient/streamxcallopt")
+				pkg.AddImports("github.com/cloudwego/kitex/pkg/streamx")
+			}
 		}
 		if len(pkg.AllMethods()) > 0 {
-			pkg.AddImports("callopt")
+			if needCallOpt(pkg) {
+				pkg.AddImports("callopt")
+			}
+			pkg.AddImports("context")
 		}
 		fallthrough
 	case HandlerFileName:
-		if len(pkg.AllMethods()) > 0 {
-			pkg.AddImports("context")
-		}
 		for _, m := range pkg.ServiceInfo.AllMethods() {
+			// for StreamX interface, every method in handler has ctx argument
+			// for old interface, streaming method in handler does not have ctx argument
+			if g.StreamX || (!m.ServerStreaming && !m.ClientStreaming) {
+				pkg.AddImports("context")
+			}
+			if g.StreamX && m.IsStreaming {
+				pkg.AddImports("github.com/cloudwego/kitex/pkg/streamx")
+			}
 			for _, a := range m.Args {
 				for _, dep := range a.Deps {
 					pkg.AddImport(dep.PkgRefName, dep.ImportPath)
@@ -474,20 +583,30 @@ func (g *generator) setImports(name string, pkg *PackageInfo) {
 			}
 		}
 	case ServerFileName, InvokerFileName:
+		// for StreamX, if there is streaming method, generate Server Interface in server.go
+		if g.StreamX {
+			for _, method := range pkg.AllMethods() {
+				if method.IsStreaming {
+					pkg.AddImports("context")
+					pkg.AddImports("github.com/cloudwego/kitex/pkg/streamx")
+				}
+			}
+		}
 		if len(pkg.CombineServices) == 0 {
 			pkg.AddImport(pkg.ServiceInfo.PkgRefName, pkg.ServiceInfo.ImportPath)
 		}
 		pkg.AddImports("server")
 	case ServiceFileName:
+		pkg.AddImports("errors")
 		pkg.AddImports("client")
-		pkg.AddImport("kitex", ImportPathTo("pkg/serviceinfo"))
+		pkg.AddImport("kitex", "github.com/cloudwego/kitex/pkg/serviceinfo")
 		pkg.AddImport(pkg.ServiceInfo.PkgRefName, pkg.ServiceInfo.ImportPath)
 		if len(pkg.AllMethods()) > 0 {
 			pkg.AddImports("context")
 		}
 		for _, m := range pkg.ServiceInfo.AllMethods() {
 			if m.GenArgResultStruct {
-				pkg.AddImports("fmt", "proto")
+				pkg.AddImports("proto")
 			} else {
 				// for method Arg and Result
 				pkg.AddImport(m.PkgRefName, m.ImportPath)
@@ -497,8 +616,22 @@ func (g *generator) setImports(name string, pkg *PackageInfo) {
 					pkg.AddImport(dep.PkgRefName, dep.ImportPath)
 				}
 			}
-			if pkg.Codec == "protobuf" {
-				pkg.AddImport("streaming", ImportPathTo("pkg/streaming"))
+			// streaming imports
+			if !g.StreamX {
+				if m.IsStreaming || pkg.Codec == "protobuf" {
+					// protobuf handler support both PingPong and Unary (streaming) requests
+					pkg.AddImport("streaming", "github.com/cloudwego/kitex/pkg/streaming")
+				}
+				if m.IsStreaming {
+					pkg.AddImports("fmt")
+				}
+			} else {
+				if m.IsStreaming {
+					pkg.AddImports("github.com/cloudwego/kitex/client/streamxclient")
+					pkg.AddImports("github.com/cloudwego/kitex/client/streamxclient/streamxcallopt")
+					pkg.AddImports("github.com/cloudwego/kitex/pkg/streamx")
+					pkg.AddImports("github.com/cloudwego/kitex/server/streamxserver")
+				}
 			}
 			if !m.Void && m.Resp != nil {
 				for _, dep := range m.Resp.Deps {
@@ -520,6 +653,30 @@ func (g *generator) setImports(name string, pkg *PackageInfo) {
 		}
 	case MainFileName:
 		pkg.AddImport("log", "log")
-		pkg.AddImport(pkg.PkgRefName, filepath.Join(pkg.ImportPath, strings.ToLower(pkg.ServiceName)))
+		if !g.Config.IsUsingMultipleServicesTpl() {
+			pkg.AddImport(pkg.PkgInfo.PkgRefName, util.JoinPath(pkg.PkgInfo.ImportPath, strings.ToLower(pkg.ServiceInfo.ServiceName)))
+		} else {
+			pkg.AddImports("server")
+			for _, svc := range pkg.Services {
+				pkg.AddImport(svc.RefName, util.JoinPath(svc.PkgInfo.ImportPath, strings.ToLower(svc.ServiceName)))
+			}
+		}
 	}
+}
+
+func needCallOpt(pkg *PackageInfo) bool {
+	// callopt is referenced only by non-streaming methods
+	needCallOpt := false
+	switch pkg.Codec {
+	case "thrift":
+		for _, m := range pkg.ServiceInfo.AllMethods() {
+			if !m.IsStreaming {
+				needCallOpt = true
+				break
+			}
+		}
+	case "protobuf":
+		needCallOpt = true
+	}
+	return needCallOpt
 }

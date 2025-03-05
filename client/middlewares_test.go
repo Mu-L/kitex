@@ -19,18 +19,22 @@ package client
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 
-	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/golang/mock/gomock"
+
+	"github.com/cloudwego/gopkg/protocol/thrift"
 
 	"github.com/cloudwego/kitex/internal/mocks"
 	mocksdiscovery "github.com/cloudwego/kitex/internal/mocks/discovery"
+	mocksproxy "github.com/cloudwego/kitex/internal/mocks/proxy"
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/discovery"
 	"github.com/cloudwego/kitex/pkg/endpoint"
 	"github.com/cloudwego/kitex/pkg/event"
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/proxy"
 	"github.com/cloudwego/kitex/pkg/remote/codec/protobuf"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
@@ -49,6 +53,7 @@ var (
 		ctx = context.WithValue(ctx, endpoint.CtxEventQueueKey, event.NewQueue(10))
 		return ctx
 	}()
+	tcpAddrStr = "127.0.0.1:9909"
 )
 
 func resolver404(ctrl *gomock.Controller) discovery.Resolver {
@@ -130,29 +135,86 @@ func TestResolverMWOutOfInstance(t *testing.T) {
 }
 
 func TestDefaultErrorHandler(t *testing.T) {
+	tcpAddr, _ := net.ResolveTCPAddr("tcp", tcpAddrStr)
+	ri := rpcinfo.NewRPCInfo(nil, rpcinfo.NewEndpointInfo("mockService", "mockMethod", tcpAddr, nil),
+		rpcinfo.NewInvocation("", ""), nil, rpcinfo.NewRPCStats())
+	reqCtx := rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
+
 	// Test TApplicationException
-	err := DefaultClientErrorHandler(thrift.NewTApplicationException(100, "mock"))
+	err := DefaultClientErrorHandler(context.Background(), thrift.NewApplicationException(100, "mock"))
 	test.Assert(t, err.Error() == "remote or network error[remote]: mock", err.Error())
-	var te thrift.TApplicationException
+	var te *thrift.ApplicationException
 	ok := errors.As(err, &te)
 	test.Assert(t, ok)
-	test.Assert(t, te.TypeId() == 100)
+	test.Assert(t, te.TypeID() == 100)
+	// Test TApplicationException with remote addr
+	err = ClientErrorHandlerWithAddr(reqCtx, thrift.NewApplicationException(100, "mock"))
+	test.Assert(t, err.Error() == "remote or network error[remote-"+tcpAddrStr+"]: mock", err.Error())
+	ok = errors.As(err, &te)
+	test.Assert(t, ok)
+	test.Assert(t, te.TypeID() == 100)
 
 	// Test PbError
-	err = DefaultClientErrorHandler(protobuf.NewPbError(100, "mock"))
+	err = DefaultClientErrorHandler(context.Background(), protobuf.NewPbError(100, "mock"))
 	test.Assert(t, err.Error() == "remote or network error[remote]: mock")
 	var pe protobuf.PBError
 	ok = errors.As(err, &pe)
 	test.Assert(t, ok)
-	test.Assert(t, te.TypeId() == 100)
+	test.Assert(t, te.TypeID() == 100)
+	// Test PbError with remote addr
+	err = ClientErrorHandlerWithAddr(reqCtx, protobuf.NewPbError(100, "mock"))
+	test.Assert(t, err.Error() == "remote or network error[remote-"+tcpAddrStr+"]: mock", err.Error())
+	ok = errors.As(err, &pe)
+	test.Assert(t, ok)
+	test.Assert(t, te.TypeID() == 100)
 
 	// Test status.Error
-	err = DefaultClientErrorHandler(status.Err(100, "mock"))
+	err = DefaultClientErrorHandler(context.Background(), status.Err(100, "mock"))
 	test.Assert(t, err.Error() == "remote or network error: rpc error: code = 100 desc = mock", err.Error())
+	// Test status.Error with remote addr
+	err = ClientErrorHandlerWithAddr(reqCtx, status.Err(100, "mock"))
+	test.Assert(t, err.Error() == "remote or network error["+tcpAddrStr+"]: rpc error: code = 100 desc = mock", err.Error())
 
 	// Test other error
-	err = DefaultClientErrorHandler(errors.New("mock"))
+	err = DefaultClientErrorHandler(context.Background(), errors.New("mock"))
 	test.Assert(t, err.Error() == "remote or network error: mock")
+	// Test other error with remote addr
+	err = ClientErrorHandlerWithAddr(reqCtx, errors.New("mock"))
+	test.Assert(t, err.Error() == "remote or network error["+tcpAddrStr+"]: mock")
+}
+
+func TestNewProxyMW(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	p := mocksproxy.NewMockForwardProxy(ctrl)
+	p.EXPECT().ResolveProxyInstance(gomock.Any()).Return(nil).Times(1)
+
+	mw := newProxyMW(p)
+
+	err := mw(func(ctx context.Context, req, resp interface{}) (err error) {
+		return nil
+	})(context.Background(), nil, nil)
+	test.Assert(t, err == nil)
+
+	tp := mocksproxy.NewMockWithMiddleware(ctrl)
+	tp.EXPECT().ProxyMiddleware().DoAndReturn(func() endpoint.Middleware {
+		return func(e endpoint.Endpoint) endpoint.Endpoint {
+			return func(ctx context.Context, req, resp interface{}) (err error) {
+				return errors.New("execute proxy middleware")
+			}
+		}
+	}).Times(1)
+	mw = newProxyMW(&struct {
+		proxy.ForwardProxy
+		proxy.WithMiddleware
+	}{
+		WithMiddleware: tp,
+	})
+	err = mw(func(ctx context.Context, req, resp interface{}) (err error) {
+		return nil
+	})(context.Background(), nil, nil)
+	test.Assert(t, err.Error() == "execute proxy middleware")
 }
 
 func BenchmarkResolverMW(b *testing.B) {
@@ -193,4 +255,27 @@ func BenchmarkResolverMWParallel(b *testing.B) {
 			mw(ep)(ctx, req, res)
 		}
 	})
+}
+
+func TestDiscoveryEventHandler(t *testing.T) {
+	bus, queue := event.NewEventBus(), event.NewQueue(200)
+	h := discoveryEventHandler(discovery.ChangeEventName, bus, queue)
+	ins := []discovery.Instance{discovery.NewInstance("tcp", "addr", 10, nil)}
+	cacheKey := "testCacheKey"
+	c := &discovery.Change{
+		Result: discovery.Result{
+			Cacheable: true,
+			CacheKey:  cacheKey,
+		},
+		Added: ins,
+	}
+	h(c)
+	events := queue.Dump().([]*event.Event)
+	test.Assert(t, len(events) == 1)
+	extra, ok := events[0].Extra.(map[string]interface{})
+	test.Assert(t, ok)
+	test.Assert(t, extra["Cacheable"] == true)
+	test.Assert(t, extra["CacheKey"] == cacheKey)
+	added := extra["Added"].([]*instInfo)
+	test.Assert(t, len(added) == 1)
 }

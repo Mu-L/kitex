@@ -18,16 +18,20 @@
 package server
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/cloudwego/localsession/backup"
+
 	"github.com/cloudwego/kitex/internal/configutil"
-	internal_stats "github.com/cloudwego/kitex/internal/stats"
+	"github.com/cloudwego/kitex/internal/stream"
 	"github.com/cloudwego/kitex/pkg/acl"
 	"github.com/cloudwego/kitex/pkg/diagnosis"
 	"github.com/cloudwego/kitex/pkg/endpoint"
 	"github.com/cloudwego/kitex/pkg/event"
+	"github.com/cloudwego/kitex/pkg/gofunc"
 	"github.com/cloudwego/kitex/pkg/limit"
 	"github.com/cloudwego/kitex/pkg/limiter"
 	"github.com/cloudwego/kitex/pkg/proxy"
@@ -63,7 +67,7 @@ type Options struct {
 	MetaHandlers []remote.MetaHandler
 
 	RemoteOpt  *remote.ServerOption
-	ErrHandle  func(error) error
+	ErrHandle  func(context.Context, error) error
 	ExitSignal func() <-chan error
 	Proxy      proxy.ReverseProxy
 
@@ -87,8 +91,17 @@ type Options struct {
 	DebugService diagnosis.Service
 
 	// Observability
-	TracerCtl  *internal_stats.Controller
+	TracerCtl  *rpcinfo.TraceController
 	StatsLevel *stats.Level
+
+	BackupOpt backup.Options
+
+	// Streaming
+	Streaming stream.StreamingConfig // old version streaming API config
+	StreamX   StreamXOptions         // new version streaming API config
+
+	RefuseTrafficWithoutServiceName bool
+	EnableContextTimeout            bool
 }
 
 type Limit struct {
@@ -109,6 +122,7 @@ func NewOptions(opts []Option) *Options {
 		Svr:          &rpcinfo.EndpointBasicInfo{},
 		Configs:      rpcinfo.NewRPCConfig(),
 		Once:         configutil.NewOptionOnce(),
+		MetaHandlers: []remote.MetaHandler{transmeta.MetainfoServerHandler},
 		RemoteOpt:    newServerRemoteOption(),
 		DebugService: diagnosis.NoopService,
 		ExitSignal:   DefaultSysExitSignal,
@@ -118,11 +132,10 @@ func NewOptions(opts []Option) *Options {
 
 		SupportedTransportsFunc: DefaultSupportedTransportsFunc,
 
-		TracerCtl: &internal_stats.Controller{},
+		TracerCtl: &rpcinfo.TraceController{},
 		Registry:  registry.NoopRegistry,
 	}
 	ApplyOptions(opts, o)
-	o.MetaHandlers = append(o.MetaHandlers, transmeta.MetainfoServerHandler)
 	rpcinfo.AsMutableRPCConfig(o.Configs).LockConfig(o.LockBits)
 	if o.StatsLevel == nil {
 		level := stats.LevelDisabled
@@ -143,18 +156,22 @@ func ApplyOptions(opts []Option, o *Options) {
 
 func DefaultSysExitSignal() <-chan error {
 	errCh := make(chan error, 1)
-	go func() {
+	gofunc.GoFunc(context.Background(), func() {
 		sig := SysExitSignal()
 		defer signal.Stop(sig)
 		<-sig
 		errCh <- nil
-	}()
+	})
 	return errCh
 }
 
 func SysExitSignal() chan os.Signal {
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM)
+	notifications := []os.Signal{syscall.SIGINT, syscall.SIGTERM}
+	if !signal.Ignored(syscall.SIGHUP) {
+		notifications = append(notifications, syscall.SIGHUP)
+	}
+	signal.Notify(signals, notifications...)
 	return signals
 }
 
@@ -162,9 +179,7 @@ func DefaultSupportedTransportsFunc(option remote.ServerOption) []string {
 	if factory, ok := option.SvrHandlerFactory.(trans.MuxEnabledFlag); ok {
 		if factory.MuxEnabled() {
 			return []string{"ttheader_mux"}
-		} else {
-			return []string{"ttheader", "framed", "ttheader_framed", "grpc"}
 		}
 	}
-	return nil
+	return []string{"ttheader", "framed", "ttheader_framed", "grpc"}
 }

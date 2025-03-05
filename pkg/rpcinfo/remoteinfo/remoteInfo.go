@@ -46,9 +46,9 @@ type RemoteInfo interface {
 	ImmutableView() rpcinfo.EndpointInfo
 }
 
-// RemoteAddrSetter is used to set remote addr.
-type RemoteAddrSetter interface {
-	SetRemoteAddr(addr net.Addr) (ok bool)
+// RefreshableInstance declares an interface which can return an instance containing the new address.
+type RefreshableInstance interface {
+	RefreshInstanceWithAddr(addr net.Addr) (newInstance discovery.Instance)
 }
 
 var (
@@ -112,10 +112,12 @@ func (ri *remoteInfo) Tag(key string) (value string, exist bool) {
 	ri.RLock()
 	defer ri.RUnlock()
 
-	value, exist = ri.tags[key]
-	if !exist && ri.instance != nil {
-		value, exist = ri.instance.Tag(key)
+	if ri.instance != nil {
+		if value, exist = ri.instance.Tag(key); exist {
+			return
+		}
 	}
+	value, exist = ri.tags[key]
 	return
 }
 
@@ -127,12 +129,13 @@ func (ri *remoteInfo) DefaultTag(key, def string) string {
 	return def
 }
 
-// SetRemoteAddr implements the RemoteAddrSetter interface.
+// SetRemoteAddr implements the RemoteInfo interface.
 func (ri *remoteInfo) SetRemoteAddr(addr net.Addr) bool {
-	if ins, ok := ri.instance.(RemoteAddrSetter); ok {
-		ri.Lock()
-		defer ri.Unlock()
-		return ins.SetRemoteAddr(addr)
+	ri.Lock()
+	defer ri.Unlock()
+	if ins, ok := ri.instance.(RefreshableInstance); ok {
+		ri.instance = ins.RefreshInstanceWithAddr(addr)
+		return true
 	}
 	return false
 }
@@ -178,6 +181,8 @@ func (ri *remoteInfo) ImmutableView() rpcinfo.EndpointInfo {
 }
 
 func (ri *remoteInfo) zero() {
+	ri.Lock()
+	defer ri.Unlock()
 	ri.serviceName = ""
 	ri.method = ""
 	ri.instance = nil

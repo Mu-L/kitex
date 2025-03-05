@@ -17,11 +17,11 @@ package generator
 import (
 	"bytes"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"text/template"
 
 	"github.com/cloudwego/kitex/tool/internal_pkg/util"
+	"github.com/cloudwego/kitex/transport"
 )
 
 // File .
@@ -35,6 +35,7 @@ type PackageInfo struct {
 	Namespace    string            // a dot-separated string for generating service package under kitex_gen
 	Dependencies map[string]string // package name => import path, used for searching imports
 	*ServiceInfo                   // the target service
+	Services     []*ServiceInfo    // all services defined in a IDL for multiple services scenario
 
 	// the following fields will be filled and used by the generator
 	Codec            string
@@ -45,6 +46,10 @@ type PackageInfo struct {
 	ExternalKitexGen string
 	Features         []feature
 	FrugalPretouch   bool
+	Module           string
+	Protocol         transport.Protocol
+	IDLName          string
+	ServerPkg        string
 }
 
 // AddImport .
@@ -53,10 +58,7 @@ func (p *PackageInfo) AddImport(pkg, path string) {
 		p.Imports = make(map[string]map[string]bool)
 	}
 	if pkg != "" {
-		if p.ExternalKitexGen != "" && strings.Contains(path, KitexGenPath) {
-			parts := strings.Split(path, KitexGenPath)
-			path = filepath.Join(p.ExternalKitexGen, parts[len(parts)-1])
-		}
+		path = p.toExternalGenPath(path)
 		if path == pkg {
 			p.Imports[path] = nil
 		} else {
@@ -79,6 +81,57 @@ func (p *PackageInfo) AddImports(pkgs ...string) {
 	}
 }
 
+// UpdateImportPath changed the mapping between alias -> import path
+// For instance:
+//
+//	Original import: alias "original_path"
+//	Invocation:      UpdateImport("alias", "new_path")
+//	New import:      alias "new_path"
+//
+// if pkg == newPath, then alias would be removed in import sentence:
+//
+//	Original import: context "path/to/custom/context"
+//	Invocation:      UpdateImport("context", "context")
+//	New import:      context
+func (p *PackageInfo) UpdateImportPath(pkg, newPath string) {
+	if p.Imports == nil || pkg == "" || newPath == "" {
+		return
+	}
+
+	newPath = p.toExternalGenPath(newPath)
+	var prevPath string
+OutLoop:
+	for path, pkgSet := range p.Imports {
+		for pkgKey := range pkgSet {
+			if pkgKey == pkg {
+				prevPath = path
+				break OutLoop
+			}
+		}
+	}
+	if prevPath == "" {
+		return
+	}
+
+	delete(p.Imports, prevPath)
+	if newPath == pkg { // remove the alias
+		p.Imports[newPath] = nil
+	} else { // change the path -> alias mapping
+		p.Imports[newPath] = map[string]bool{
+			pkg: true,
+		}
+	}
+}
+
+func (p *PackageInfo) toExternalGenPath(path string) string {
+	if p.ExternalKitexGen == "" || !strings.Contains(path, KitexGenPath) {
+		return path
+	}
+	parts := strings.Split(path, KitexGenPath)
+	newPath := util.JoinPath(p.ExternalKitexGen, parts[len(parts)-1])
+	return newPath
+}
+
 // PkgInfo .
 type PkgInfo struct {
 	PkgName    string
@@ -89,22 +142,55 @@ type PkgInfo struct {
 // ServiceInfo .
 type ServiceInfo struct {
 	PkgInfo
-	ServiceName     string
-	RawServiceName  string
-	ServiceTypeName func() string
-	Base            *ServiceInfo
-	Methods         []*MethodInfo
-	CombineServices []*ServiceInfo
-	HasStreaming    bool
+	ServiceName           string
+	RawServiceName        string
+	ServiceTypeName       func() string
+	Base                  *ServiceInfo
+	Methods               []*MethodInfo
+	CombineServices       []*ServiceInfo
+	HasStreaming          bool
+	ServiceFilePath       string
+	Protocol              string
+	HandlerReturnKeepResp bool
+	UseThriftReflection   bool
+	// for multiple services scenario, the reference name for the service
+	RefName string
+	// identify whether this service would generate a corresponding handler.
+	GenerateHandler bool
+	// whether to generate StreamX interface code
+	StreamX bool
 }
 
 // AllMethods returns all methods that the service have.
 func (s *ServiceInfo) AllMethods() (ms []*MethodInfo) {
-	ms = s.Methods
+	ms = append(ms, s.Methods...)
 	for base := s.Base; base != nil; base = base.Base {
 		ms = append(base.Methods, ms...)
 	}
 	return ms
+}
+
+// FixHasStreamingForExtendedService updates the HasStreaming field for extended services.
+func (s *ServiceInfo) FixHasStreamingForExtendedService() {
+	if s.Base == nil {
+		return
+	}
+	if s.HasStreaming {
+		return
+	}
+	s.Base.FixHasStreamingForExtendedService()
+	s.HasStreaming = s.Base.HasStreamingRecursive()
+}
+
+// HasStreamingRecursive recursively check if the service has streaming method
+func (s *ServiceInfo) HasStreamingRecursive() bool {
+	if s.HasStreaming {
+		return true
+	}
+	if s.Base == nil {
+		return false
+	}
+	return s.Base.HasStreamingRecursive()
 }
 
 // MethodInfo .
@@ -116,14 +202,33 @@ type MethodInfo struct {
 	Oneway                 bool
 	Void                   bool
 	Args                   []*Parameter
+	ArgsLength             int
 	Resp                   *Parameter
 	Exceptions             []*Parameter
 	ArgStructName          string
 	ResStructName          string
 	IsResponseNeedRedirect bool // int -> int*
 	GenArgResultStruct     bool
+	IsStreaming            bool
 	ClientStreaming        bool
 	ServerStreaming        bool
+	StreamX                bool
+}
+
+func (m *MethodInfo) StreamingMode() string {
+	if !m.IsStreaming {
+		return ""
+	}
+	if m.ClientStreaming {
+		if m.ServerStreaming {
+			return "bidirectional"
+		}
+		return "client"
+	}
+	if m.ServerStreaming {
+		return "server"
+	}
+	return "unary"
 }
 
 // Parameter .
@@ -135,15 +240,25 @@ type Parameter struct {
 }
 
 var funcs = map[string]interface{}{
-	"ToLower":    strings.ToLower,
-	"LowerFirst": util.LowerFirst,
-	"UpperFirst": util.UpperFirst,
-	"NotPtr":     util.NotPtr,
-	"HasFeature": HasFeature,
+	"ToLower":       strings.ToLower,
+	"LowerFirst":    util.LowerFirst,
+	"UpperFirst":    util.UpperFirst,
+	"NotPtr":        util.NotPtr,
+	"ReplaceString": util.ReplaceString,
+	"SnakeString":   util.SnakeString,
+	"HasFeature":    HasFeature,
+	"FilterImports": FilterImports,
+	"backquoted":    BackQuoted,
+	"getStreamxRef": ToStreamxRef,
+}
+
+func AddTemplateFunc(key string, f interface{}) {
+	funcs[key] = f
 }
 
 var templateNames = []string{
 	"@client.go-NewClient-option",
+	"@client.go-NewStreamClient-option",
 	"@client.go-EOF",
 	"@server.go-NewServer-option",
 	"@server.go-EOF",
@@ -256,4 +371,54 @@ func (t *Task) Render(data interface{}) (*File, error) {
 		return nil, err
 	}
 	return &File{t.Path, buf.String()}, nil
+}
+
+func (t *Task) RenderString(data interface{}) (string, error) {
+	if t.Template == nil {
+		err := t.Build()
+		if err != nil {
+			return "", err
+		}
+	}
+
+	var buf bytes.Buffer
+	err := t.ExecuteTemplate(&buf, t.Name, data)
+	if err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func FilterImports(Imports map[string]map[string]bool, ms []*MethodInfo) map[string]map[string]bool {
+	res := map[string]map[string]bool{}
+	for _, m := range ms {
+		if m.Resp != nil {
+			for _, dep := range m.Resp.Deps {
+				if _, ok := Imports[dep.ImportPath]; ok {
+					res[dep.ImportPath] = Imports[dep.ImportPath]
+				}
+			}
+		}
+		for _, arg := range m.Args {
+			for _, dep := range arg.Deps {
+				if _, ok := Imports[dep.ImportPath]; ok {
+					res[dep.ImportPath] = Imports[dep.ImportPath]
+				}
+			}
+		}
+	}
+	return res
+}
+
+func BackQuoted(s string) string {
+	return "`" + s + "`"
+}
+
+func ToStreamxRef(protocol transport.Protocol) string {
+	switch protocol {
+	case transport.TTHeader:
+		return streamxTTHeaderRef
+	default:
+		return ""
+	}
 }

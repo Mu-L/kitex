@@ -18,16 +18,17 @@ import (
 	"fmt"
 	"go/build"
 	"go/format"
-	"io/ioutil"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"unicode"
-
-	"github.com/cloudwego/kitex/tool/internal_pkg/log"
 )
 
 // StringSlice implements the flag.Value interface on string slices
@@ -54,17 +55,16 @@ func FormatCode(code []byte) ([]byte, error) {
 }
 
 // GetGOPATH retrieves the GOPATH from environment variables or the `go env` command.
-func GetGOPATH() string {
+func GetGOPATH() (string, error) {
 	goPath := os.Getenv("GOPATH")
 	// If there are many path in GOPATH, pick up the first one.
-	if GoPaths := strings.Split(goPath, ":"); len(GoPaths) > 1 {
-		return GoPaths[0]
+	if GoPaths := strings.Split(goPath, ":"); len(GoPaths) >= 1 && strings.TrimSpace(GoPaths[0]) != "" {
+		return strings.TrimSpace(GoPaths[0]), nil
 	}
 	// GOPATH not set through environment variables, try to get one by executing "go env GOPATH"
 	output, err := exec.Command("go", "env", "GOPATH").Output()
 	if err != nil {
-		log.Warn(err)
-		os.Exit(1)
+		return "", err
 	}
 
 	goPath = strings.TrimSpace(string(output))
@@ -74,9 +74,9 @@ func GetGOPATH() string {
 	}
 
 	if len(goPath) == 0 {
-		panic("GOPATH not found")
+		return "", fmt.Errorf("GOPATH not found")
 	}
-	return goPath
+	return goPath, nil
 }
 
 // Exists reports whether a file exists.
@@ -95,6 +95,29 @@ func LowerFirst(s string) string {
 	return string(rs)
 }
 
+// ReplaceString be used in string substitution.
+func ReplaceString(s, old, new string, n int) string {
+	return strings.Replace(s, old, new, n)
+}
+
+// SnakeString converts the string 's' to a snake string
+func SnakeString(s string) string {
+	data := make([]byte, 0, len(s)*2)
+	j := false
+	for _, d := range []byte(s) {
+		if d >= 'A' && d <= 'Z' {
+			if j {
+				data = append(data, '_')
+				j = false
+			}
+		} else if d != '_' {
+			j = true
+		}
+		data = append(data, d)
+	}
+	return strings.ToLower(string(data))
+}
+
 // UpperFirst converts the first letter to upper case for the given string.
 func UpperFirst(s string) string {
 	rs := []rune(s)
@@ -102,7 +125,7 @@ func UpperFirst(s string) string {
 	return string(rs)
 }
 
-// NotPtr converts an pointer type into non-pointer type.
+// NotPtr converts a pointer type into non-pointer type.
 func NotPtr(s string) string {
 	return strings.ReplaceAll(s, "*", "")
 }
@@ -112,7 +135,7 @@ func NotPtr(s string) string {
 func SearchGoMod(cwd string) (moduleName, path string, found bool) {
 	for {
 		path = filepath.Join(cwd, "go.mod")
-		data, err := ioutil.ReadFile(path)
+		data, err := os.ReadFile(path)
 		if err == nil {
 			re := regexp.MustCompile(`^\s*module\s+(\S+)\s*`)
 			for _, line := range strings.Split(string(data), "\n") {
@@ -127,10 +150,11 @@ func SearchGoMod(cwd string) (moduleName, path string, found bool) {
 		if !os.IsNotExist(err) {
 			return
 		}
-		if cwd == "/" {
+		parentCwd := filepath.Dir(cwd)
+		if parentCwd == cwd {
 			break
 		}
-		cwd = filepath.Dir(cwd)
+		cwd = parentCwd
 	}
 	return
 }
@@ -140,7 +164,7 @@ func RunGitCommand(gitLink string) (string, string, error) {
 	if err != nil {
 		return "", "Failed to get home dir", err
 	}
-	cachePath := filepath.Join(u.HomeDir, ".kitex", "cache")
+	cachePath := JoinPath(u.HomeDir, ".kitex", "cache")
 
 	branch := ""
 	if strings.Contains(gitLink, ".git@") {
@@ -165,9 +189,9 @@ func RunGitCommand(gitLink string) (string, string, error) {
 	if branch != "" {
 		branchSuffix = "@" + branch
 	}
-	gitPath := filepath.Join(cachePath, repoLink+branchSuffix)
+	gitPath := JoinPath(cachePath, repoLink+branchSuffix)
 
-	_, err = os.Stat(filepath.Join(gitPath, ".git"))
+	_, err = os.Stat(JoinPath(gitPath, ".git"))
 	if err != nil && !os.IsExist(err) {
 		err = os.MkdirAll(gitPath, os.ModePerm)
 		if err != nil {
@@ -189,26 +213,133 @@ func RunGitCommand(gitLink string) (string, string, error) {
 		}
 	}
 
-	cmdFetch := exec.Command("git", "fetch", "--all")
-	cmdFetch.Dir = gitPath
-	out, gitErr := cmdFetch.CombinedOutput()
-	if gitErr != nil {
-		return "", string(out), gitErr
-	}
-
-	cmdReset := exec.Command("git", "reset", "--hard", "master")
-	cmdReset.Dir = gitPath
-	out, gitErr = cmdReset.CombinedOutput()
-	if gitErr != nil {
-		return "", string(out), gitErr
-	}
-
 	cmdPull := exec.Command("git", "pull")
 	cmdPull.Dir = gitPath
-	out, gitErr = cmdPull.CombinedOutput()
+	out, gitErr := cmdPull.CombinedOutput()
 	if gitErr != nil {
 		return "", string(out), gitErr
 	}
 
 	return gitPath, "", nil
+}
+
+// CombineOutputPath read the output and path variables and render them into the final path
+func CombineOutputPath(outputPath, ns string) string {
+	if ns != "" {
+		ns = strings.ReplaceAll(ns, ".", "/")
+	}
+	hasVarNs := strings.Contains(outputPath, "{namespace}")
+	hasVarNsUnderscore := strings.Contains(outputPath, "{namespaceUnderscore}")
+	if hasVarNs || hasVarNsUnderscore {
+		if hasVarNs {
+			outputPath = strings.ReplaceAll(outputPath, "{namespace}", ns)
+		} else if hasVarNsUnderscore {
+			outputPath = strings.ReplaceAll(outputPath, "{namespaceUnderscore}", strings.ReplaceAll(ns, "/", "_"))
+		}
+	} else {
+		outputPath = JoinPath(outputPath, ns)
+	}
+	return outputPath
+}
+
+// JoinPath joins dirs as golang import format, such as xx/xx/xx
+func JoinPath(elem ...string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ReplaceAll(filepath.Join(elem...), "\\", "/")
+	}
+	return filepath.Join(elem...)
+}
+
+// DownloadFile Download file to local
+func DownloadFile(remotePath, localPath string) error {
+	resp, err := http.Get(remotePath)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download file, http status: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	err = os.WriteFile(localPath, body, 0o644)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// IDLName returns the name of the IDL file.
+func IDLName(filename string) string {
+	return filepath.Base(filename)
+}
+
+type Import struct {
+	Alias string
+	Path  string
+}
+
+func SortImports(imps map[string]string, localPrefix string) (ret []Import) {
+	stds := make([]Import, 0, len(imps))
+	locals := make([]Import, 0, len(imps))
+	thirds := make([]Import, 0, len(imps))
+	for path, alias := range imps {
+		if strings.HasPrefix(path, localPrefix+"/") {
+			locals = append(locals, Import{alias, path})
+		} else if !strings.Contains(path, ".") {
+			stds = append(stds, Import{alias, path})
+		} else {
+			thirds = append(thirds, Import{alias, path})
+		}
+	}
+
+	sort.SliceStable(stds, func(i, j int) bool {
+		return stds[i].Path < stds[j].Path
+	})
+	ret = append(ret, stds...)
+	if len(thirds) > 0 {
+		ret = append(ret, Import{"", ""})
+	}
+	sort.SliceStable(thirds, func(i, j int) bool {
+		return thirds[i].Path < thirds[j].Path
+	})
+	ret = append(ret, thirds...)
+	if len(locals) > 0 {
+		ret = append(ret, Import{"", ""})
+	}
+	sort.SliceStable(locals, func(i, j int) bool {
+		return locals[i].Path < locals[j].Path
+	})
+	ret = append(ret, locals...)
+	return ret
+}
+
+func (i Import) PackageName() string {
+	if i.Alias != "" {
+		return i.Alias
+	} else {
+		return strings.ToLower(filepath.Base(i.Path))
+	}
+}
+
+func PrintlImports(imports []Import) string {
+	builder := strings.Builder{}
+	for _, v := range imports {
+		if v.Path != "" {
+			builder.WriteString(fmt.Sprintf("%s %q\n", v.Alias, v.Path))
+		} else {
+			builder.WriteString("\n")
+		}
+	}
+	return builder.String()
+}
+
+func ToString(val interface{}) string {
+	if stringer, ok := val.(fmt.Stringer); ok {
+		return stringer.String()
+	}
+	return ""
 }

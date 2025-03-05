@@ -19,7 +19,6 @@ package protobuf
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
@@ -204,7 +203,7 @@ type MockReqArgs struct {
 
 func (p *MockReqArgs) Marshal(out []byte) ([]byte, error) {
 	if !p.IsSetReq() {
-		return out, fmt.Errorf("No req in MockReqArgs")
+		return out, nil
 	}
 	return proto.Marshal(p.Req)
 }

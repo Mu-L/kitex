@@ -17,9 +17,11 @@
 package generic
 
 import (
+	"context"
 	"errors"
 	"sync"
 
+	dproto "github.com/cloudwego/dynamicgo/proto"
 	"github.com/jhump/protoreflect/desc/protoparse"
 
 	"github.com/cloudwego/kitex/pkg/generic/proto"
@@ -30,7 +32,15 @@ type PbContentProvider struct {
 	svcs      chan proto.ServiceDescriptor
 }
 
-var _ PbDescriptorProvider = (*PbContentProvider)(nil)
+type PbFileProviderWithDynamicGo struct {
+	closeOnce sync.Once
+	svcs      chan *dproto.ServiceDescriptor
+}
+
+var (
+	_ PbDescriptorProvider          = (*PbContentProvider)(nil)
+	_ PbDescriptorProviderDynamicGo = (*PbFileProviderWithDynamicGo)(nil)
+)
 
 func NewPbContentProvider(main string, includes map[string]string) (PbDescriptorProvider, error) {
 	p := &PbContentProvider{
@@ -46,6 +56,8 @@ func NewPbContentProvider(main string, includes map[string]string) (PbDescriptor
 	return p, nil
 }
 
+// UpdateIDL updates idl
+// NOTE: Since an IDL update is asynchronous, it may not be applied immediately, potentially causing a temporary data inconsistency.
 func (p *PbContentProvider) UpdateIDL(main string, includes map[string]string) error {
 	sd, err := parseProto(main, includes)
 	if err != nil {
@@ -84,6 +96,7 @@ func parseProto(main string, includes map[string]string) (proto.ServiceDescripto
 		return nil, errors.New("no service descriptor found")
 	}
 
+	// TODO: support parse mode. now only support first service
 	return services[0], nil
 }
 
@@ -92,6 +105,69 @@ func (p *PbContentProvider) Provide() <-chan proto.ServiceDescriptor {
 }
 
 func (p *PbContentProvider) Close() error {
+	p.closeOnce.Do(func() {
+		close(p.svcs)
+	})
+	return nil
+}
+
+// NewPbFileProviderWithDynamicGo ..
+func NewPbFileProviderWithDynamicGo(main string, ctx context.Context, options dproto.Options, importDirs ...string) (PbDescriptorProviderDynamicGo, error) {
+	p := &PbFileProviderWithDynamicGo{
+		svcs: make(chan *dproto.ServiceDescriptor, 1),
+	}
+
+	svc, err := options.NewDescriptorFromPath(ctx, main, importDirs...)
+	if err != nil {
+		return nil, err
+	}
+	p.svcs <- svc
+
+	return p, nil
+}
+
+// NewPbContentProviderWithDynamicGo creates PbFileProviderWithDynamicGo from memory.
+// NOTICE: mainPath is used to store mainContent in includes, thus it MUST NOT conflict with original includes
+func NewPbContentProviderWithDynamicGo(ctx context.Context, options dproto.Options, mainPath, mainContent string, includes map[string]string) (PbDescriptorProviderDynamicGo, error) {
+	p := &PbFileProviderWithDynamicGo{
+		svcs: make(chan *dproto.ServiceDescriptor, 1),
+	}
+
+	sd, err := options.NewDesccriptorFromContent(ctx, mainPath, mainContent, includes)
+	if err != nil {
+		return nil, err
+	}
+	p.svcs <- sd
+
+	return p, nil
+}
+
+// UpdateIDL updates idl
+// NOTE: Since an IDL update is asynchronous, it may not be applied immediately, potentially causing a temporary data inconsistency.
+func (p *PbFileProviderWithDynamicGo) UpdateIDL(ctx context.Context, options dproto.Options, mainPath, mainContent string, includes map[string]string) error {
+	sd, err := options.NewDesccriptorFromContent(ctx, mainPath, mainContent, includes)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-p.svcs:
+	default:
+	}
+
+	select {
+	case p.svcs <- sd:
+	default:
+	}
+
+	return nil
+}
+
+func (p *PbFileProviderWithDynamicGo) Provide() <-chan *dproto.ServiceDescriptor {
+	return p.svcs
+}
+
+func (p *PbFileProviderWithDynamicGo) Close() error {
 	p.closeOnce.Do(func() {
 		close(p.svcs)
 	})

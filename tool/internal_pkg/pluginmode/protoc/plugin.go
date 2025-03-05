@@ -121,16 +121,18 @@ func (pp *protocPlugin) GenerateFile(gen *protogen.Plugin, file *protogen.File) 
 	}
 	gopkg := file.Proto.GetOptions().GetGoPackage()
 	if !strings.HasPrefix(gopkg, pp.PackagePrefix) {
-		log.Warnf("[WARN] %q is skipped because its import path %q is not located in ./kitex_gen. Change the go_package option or use '--protobuf M%s=A-Import-Path-In-kitex_gen' to override it if you want this file to be generated under kitex_gen.\n",
+		log.Warnf("%q is skipped because its import path %q is not located in ./kitex_gen.\n"+
+			"Change the go_package option or use '--protobuf M%s=A-Import-Path-In-kitex_gen' to override it if you want this file to be generated under kitex_gen.\n",
 			file.Proto.GetName(), gopkg, file.Proto.GetName())
 		return
 	}
-	log.Infof("[INFO] Generate %q at %q\n", file.Proto.GetName(), gopkg)
+	log.Debugf("Generate %q at %q\n", file.Proto.GetName(), gopkg)
 
 	if parts := strings.Split(gopkg, ";"); len(parts) > 1 {
 		gopkg = parts[0] // remove package alias from file path
 	}
 	pp.Namespace = strings.TrimPrefix(gopkg, pp.PackagePrefix)
+	pp.IDLName = util.IDLName(pp.Config.IDL)
 
 	ss := pp.convertTypes(file)
 	pp.Services = append(pp.Services, ss...)
@@ -163,7 +165,7 @@ func (pp *protocPlugin) GenerateFile(gen *protogen.Plugin, file *protogen.File) 
 		f.QualifiedGoIdent(protogen.GoIdent{GoImportPath: "context"})
 		if hasStreaming {
 			f.QualifiedGoIdent(protogen.GoIdent{
-				GoImportPath: protogen.GoImportPath(generator.ImportPathTo("pkg/streaming")),
+				GoImportPath: "github.com/cloudwego/kitex/pkg/streaming",
 			})
 		}
 		f.P("var _ context.Context")
@@ -215,8 +217,35 @@ func (pp *protocPlugin) process(gen *protogen.Plugin) {
 			gen.Error(errors.New("no service defined"))
 			return
 		}
-		pp.ServiceInfo = pp.Services[len(pp.Services)-1]
+		if !pp.IsUsingMultipleServicesTpl() {
+			// if -tpl multiple_services is not set, specify the last service as the target service
+			pp.ServiceInfo = pp.Services[len(pp.Services)-1]
+		} else {
+			var svcs []*generator.ServiceInfo
+			for _, svc := range pp.Services {
+				if svc.GenerateHandler {
+					svc.RefName = "service" + svc.ServiceName
+					svcs = append(svcs, svc)
+				}
+			}
+			pp.PackageInfo.Services = svcs
+		}
 		fs, err := pp.kg.GenerateMainPackage(&pp.PackageInfo)
+		if err != nil {
+			pp.err = err
+		}
+		for _, f := range fs {
+			gen.NewGeneratedFile(pp.adjustPath(f.Name), "").P(f.Content)
+		}
+	}
+
+	if pp.Config.TemplateDir != "" {
+		if len(pp.Services) == 0 {
+			gen.Error(errors.New("no service defined"))
+			return
+		}
+		pp.ServiceInfo = pp.Services[len(pp.Services)-1]
+		fs, err := pp.kg.GenerateCustomPackage(&pp.PackageInfo)
 		if err != nil {
 			pp.err = err
 		}
@@ -267,9 +296,13 @@ func (pp *protocPlugin) convertTypes(file *protogen.File) (ss []*generator.Servi
 				ServerStreaming:    m.Desc.IsStreamingServer(),
 			}
 			si.Methods = append(si.Methods, mi)
-			if !si.HasStreaming && (mi.ClientStreaming || mi.ServerStreaming) {
+			if mi.ClientStreaming || mi.ServerStreaming {
+				mi.IsStreaming = true
 				si.HasStreaming = true
 			}
+		}
+		if file.Generate {
+			si.GenerateHandler = true
 		}
 		ss = append(ss, si)
 	}
@@ -285,7 +318,7 @@ func (pp *protocPlugin) convertTypes(file *protogen.File) (ss []*generator.Servi
 		mm := make(map[string]*generator.MethodInfo)
 		for _, m := range methods {
 			if _, ok := mm[m.Name]; ok {
-				log.Warnf("[WARN] combine service method %s in %s conflicts with %s in %s\n",
+				log.Warnf("combine service method %s in %s conflicts with %s in %s\n",
 					m.Name, m.ServiceName, m.Name, mm[m.Name].ServiceName)
 				return
 			}
@@ -373,15 +406,15 @@ func (pp *protocPlugin) makeInterfaces(gf *protogen.GeneratedFile, file *protoge
 func (pp *protocPlugin) adjustPath(path string) (ret string) {
 	cur, _ := filepath.Abs(".")
 	if pp.Config.Use == "" {
-		cur = filepath.Join(cur, generator.KitexGenPath)
+		cur = util.JoinPath(cur, generator.KitexGenPath)
 	}
 	if filepath.IsAbs(path) {
 		path, _ = filepath.Rel(cur, path)
 		return path
 	}
 	if pp.ModuleName == "" {
-		gopath := util.GetGOPATH()
-		path = filepath.Join(gopath, "src", path)
+		gopath, _ := util.GetGOPATH()
+		path = util.JoinPath(gopath, "src", path)
 		path, _ = filepath.Rel(cur, path)
 	} else {
 		path, _ = filepath.Rel(pp.ModuleName, path)

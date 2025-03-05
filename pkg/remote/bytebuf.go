@@ -29,9 +29,11 @@ type ByteBufferFactory interface {
 // NocopyWrite is to write []byte without copying, and splits the original buffer.
 // It is used with linked buffer implement.
 type NocopyWrite interface {
-	// the buf will be wrapped as a new data node no copy, then insert into the linked buffer.
+	// WriteDirect will wrap buf as a new data node no copy, then insert into the linked buffer.
 	// remainCap is the remain capacity of origin buff.
 	WriteDirect(buf []byte, remainCap int) error
+	// MallocAck correct the real malloc len to n
+	MallocAck(n int) error
 }
 
 // FrameWrite is to write header and data buffer separately to avoid memory copy
@@ -73,13 +75,13 @@ type ByteBuffer interface {
 
 	// ReadBinary like ReadString.
 	// Returns a copy of original buffer.
-	ReadBinary(n int) (p []byte, err error)
+	ReadBinary(p []byte) (n int, err error)
 
 	// Malloc n bytes sequentially in the writer buffer.
 	Malloc(n int) (buf []byte, err error)
 
-	// MallocLen returns the total length of the buffer malloced.
-	MallocLen() (length int)
+	// WrittenLen returns the total length of the buffer writtenLen.
+	WrittenLen() (length int)
 
 	// WriteString is a more efficient way to write string, using the unsafe method to convert the string to []byte.
 	WriteString(s string) (n int, err error)

@@ -26,11 +26,11 @@ import (
 
 	"github.com/cloudwego/kitex/internal/client"
 	"github.com/cloudwego/kitex/pkg/discovery"
+	"github.com/cloudwego/kitex/pkg/fallback"
 	"github.com/cloudwego/kitex/pkg/http"
 	"github.com/cloudwego/kitex/pkg/retry"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
-	"github.com/cloudwego/kitex/pkg/utils"
 )
 
 var callOptionsPool = sync.Pool{
@@ -44,7 +44,9 @@ type CallOptions struct {
 	httpResolver http.Resolver
 
 	// export field for using in client
-	RetryPolicy retry.Policy
+	RetryPolicy    retry.Policy
+	Fallback       *fallback.Policy
+	CompressorName string
 }
 
 func newOptions() interface{} {
@@ -63,6 +65,7 @@ func (co *CallOptions) Recycle() {
 	co.configs = nil
 	co.svr = nil
 	co.RetryPolicy = retry.Policy{}
+	co.Fallback = nil
 	co.locks.Zero()
 	callOptionsPool.Put(co)
 }
@@ -70,6 +73,19 @@ func (co *CallOptions) Recycle() {
 // Option is a series of options used at the beginning of a RPC call.
 type Option struct {
 	f func(o *CallOptions, di *strings.Builder)
+}
+
+// F returns the function of the option.
+// It's useful for creating streamcall.Option from existing callopt.Option
+// Note: not all callopt.Option(s) are available for stream clients.
+func (o Option) F() func(o *CallOptions, di *strings.Builder) {
+	return o.f
+}
+
+// NewOption returns a new Option with the given function.
+// It's useful for converting streamcall.Option back to a callopt.Option
+func NewOption(f func(o *CallOptions, di *strings.Builder)) Option {
+	return Option{f: f}
 }
 
 // WithHostPort specifies the target address for a RPC call.
@@ -129,9 +145,7 @@ func WithHTTPHost(host string) Option {
 // client.WithTimeoutProvider is specified.
 func WithRPCTimeout(d time.Duration) Option {
 	return Option{func(o *CallOptions, di *strings.Builder) {
-		di.WriteString("WithRPCTimeout(")
-		utils.WriteInt64ToStringBuilder(di, d.Milliseconds())
-		di.WriteString("ms)")
+		di.WriteString("WithRPCTimeout()")
 
 		o.configs.SetRPCTimeout(d)
 		o.locks.Bits |= rpcinfo.BitRPCTimeout
@@ -145,9 +159,7 @@ func WithRPCTimeout(d time.Duration) Option {
 // WithConnectTimeout specifies the connection timeout for a RPC call.
 func WithConnectTimeout(d time.Duration) Option {
 	return Option{func(o *CallOptions, di *strings.Builder) {
-		di.WriteString("WithConnectTimeout(")
-		utils.WriteInt64ToStringBuilder(di, d.Milliseconds())
-		di.WriteString("ms)")
+		di.WriteString("WithConnectTimeout()")
 
 		o.configs.SetConnectTimeout(d)
 		o.locks.Bits |= rpcinfo.BitConnectTimeout
@@ -170,21 +182,28 @@ func WithTag(key, val string) Option {
 }
 
 // WithRetryPolicy sets the retry policy for a RPC call.
-// Build retry.Policy with retry.BuildFailurePolicy or retry.BuildBackupRequest instead of building retry.Policy directly.
-// Below is use demo, eg:
+// Build retry.Policy with retry.BuildFailurePolicy or retry.BuildBackupRequest or retry.BuildMixedPolicy
+// instead of building retry.Policy directly.
 //
-//	  demo1. call with failure retry policy, default retry error is Timeout
-//	  	resp, err := cli.Mock(ctx, req, callopt.WithRetryPolicy(retry.BuildFailurePolicy(retry.NewFailurePolicy())))
-//	  demo2. call with backup request policy
-//	  	bp := retry.NewBackupPolicy(10)
-//		 	bp.WithMaxRetryTimes(1)
-//	  	resp, err := cli.Mock(ctx, req, callopt.WithRetryPolicy(retry.BuildBackupRequest(bp)))
+// Demos are provided below:
+//
+//	demo1. call with failure retry policy, default retry error is Timeout
+//		`resp, err := cli.Mock(ctx, req, callopt.WithRetryPolicy(retry.BuildFailurePolicy(retry.NewFailurePolicy())))`
+//	demo2. call with backup request policy
+//		`bp := retry.NewBackupPolicy(10)
+//		`bp.WithMaxRetryTimes(1)`
+//		`resp, err := cli.Mock(ctx, req, callopt.WithRetryPolicy(retry.BuildBackupRequest(bp)))`
+//	demo2. call with miexed request policy
+//		`bp := retry.BuildMixedPolicy(10)
+//		`resp, err := cli.Mock(ctx, req, callopt.WithRetryPolicy(retry.BuildMixedPolicy(retry.NewMixedPolicy(10))))`
 func WithRetryPolicy(p retry.Policy) Option {
 	return Option{f: func(o *CallOptions, di *strings.Builder) {
 		if !p.Enable {
 			return
 		}
-		if p.Type == retry.BackupType {
+		if p.Type == retry.MixedType {
+			di.WriteString("WithMixedRetry")
+		} else if p.Type == retry.BackupType {
 			di.WriteString("WithBackupRequest")
 		} else {
 			di.WriteString("WithFailureRetry")
@@ -193,11 +212,42 @@ func WithRetryPolicy(p retry.Policy) Option {
 	}}
 }
 
+// WithFallback is used to set the fallback policy for a RPC call.
+// Demos are provided below:
+//
+//	demo1. call with fallback for error
+//		`resp, err := cli.Mock(ctx, req, callopt.WithFallback(fallback.ErrorFallback(yourFBFunc))`
+//	demo2. call with fallback for error and enable reportAsFallback, which sets reportAsFallback to be true and will do report(metric) as Fallback result
+//		`resp, err := cli.Mock(ctx, req, callopt.WithFallback(fallback.ErrorFallback(yourFBFunc).EnableReportAsFallback())`
+func WithFallback(fb *fallback.Policy) Option {
+	return Option{f: func(o *CallOptions, di *strings.Builder) {
+		if !fallback.IsPolicyValid(fb) {
+			return
+		}
+		di.WriteString("WithFallback")
+		o.Fallback = fb
+	}}
+}
+
+// WithGRPCCompressor specifies the compressor for the GRPC frame payload.
+// Supported compressor names: identity, gzip
+// Custom compressors can be registered via `encoding.RegisterCompressor`
+func WithGRPCCompressor(compressorName string) Option {
+	return Option{f: func(o *CallOptions, di *strings.Builder) {
+		di.WriteString("WithGRPCCompressor")
+		di.WriteByte('(')
+		di.WriteString(compressorName)
+		di.WriteByte(')')
+		o.CompressorName = compressorName
+	}}
+}
+
 // Apply applies call options to the rpcinfo.RPCConfig and internal.RemoteInfo of kitex client.
 // The return value records the name and arguments of each option.
 // This function is for internal purpose only.
 func Apply(cos []Option, cfg rpcinfo.MutableRPCConfig, svr remoteinfo.RemoteInfo, locks *client.ConfigLocks, httpResolver http.Resolver) (string, *CallOptions) {
 	var buf strings.Builder
+	buf.Grow(64)
 
 	co := callOptionsPool.Get().(*CallOptions)
 	co.configs = cfg

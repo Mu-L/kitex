@@ -17,8 +17,10 @@
 package retry
 
 import (
+	"context"
 	"fmt"
 
+	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 )
 
@@ -29,6 +31,7 @@ type Type int
 const (
 	FailureType Type = iota
 	BackupType
+	MixedType
 )
 
 // String prints human readable information.
@@ -38,6 +41,8 @@ func (t Type) String() string {
 		return "Failure"
 	case BackupType:
 		return "Backup"
+	case MixedType:
+		return "Mixed"
 	}
 	return ""
 }
@@ -58,7 +63,16 @@ func BuildBackupRequest(p *BackupPolicy) Policy {
 	return Policy{Enable: true, Type: BackupType, BackupPolicy: p}
 }
 
+// BuildMixedPolicy is used to build Policy with *MixedPolicy
+func BuildMixedPolicy(p *MixedPolicy) Policy {
+	if p == nil {
+		return Policy{}
+	}
+	return Policy{Enable: true, Type: MixedType, MixedPolicy: p}
+}
+
 // Policy contains all retry policies
+// DON'T FORGET to update Equals() and DeepCopy() if you add new fields
 type Policy struct {
 	Enable bool `json:"enable"`
 	// 0 is failure retry, 1 is backup
@@ -66,37 +80,49 @@ type Policy struct {
 	// notice: only one retry policy can be enabled, which one depend on Policy.Type
 	FailurePolicy *FailurePolicy `json:"failure_policy,omitempty"`
 	BackupPolicy  *BackupPolicy  `json:"backup_policy,omitempty"`
+	MixedPolicy   *MixedPolicy   `json:"mixed_policy,omitempty"`
+}
+
+func (p *Policy) DeepCopy() *Policy {
+	if p == nil {
+		return nil
+	}
+	return &Policy{
+		Enable:        p.Enable,
+		Type:          p.Type,
+		FailurePolicy: p.FailurePolicy.DeepCopy(),
+		BackupPolicy:  p.BackupPolicy.DeepCopy(),
+		MixedPolicy:   p.MixedPolicy.DeepCopy(),
+	}
 }
 
 // FailurePolicy for failure retry
+// DON'T FORGET to update Equals() and DeepCopy() if you add new fields
 type FailurePolicy struct {
 	StopPolicy        StopPolicy         `json:"stop_policy"`
 	BackOffPolicy     *BackOffPolicy     `json:"backoff_policy,omitempty"`
 	RetrySameNode     bool               `json:"retry_same_node"`
 	ShouldResultRetry *ShouldResultRetry `json:"-"`
-}
 
-// IsRespRetryNonNil is used to judge if RespRetry is nil
-func (p FailurePolicy) IsRespRetryNonNil() bool {
-	if p.ShouldResultRetry != nil && p.ShouldResultRetry.RespRetry != nil {
-		return true
-	}
-	return false
-}
-
-// IsErrorRetryNonNil is used to judge if ErrorRetry is nil
-func (p FailurePolicy) IsErrorRetryNonNil() bool {
-	if p.ShouldResultRetry != nil && p.ShouldResultRetry.ErrorRetry != nil {
-		return true
-	}
-	return false
+	// Extra is not used directly by kitex. It's used for better integrating your own config source.
+	// After loading FailurePolicy from your config source, `Extra` can be decoded into a user-defined schema,
+	// with which, more complex strategies can be implemented, such as modifying the `ShouldResultRetry`.
+	Extra string `json:"extra"`
 }
 
 // BackupPolicy for backup request
+// DON'T FORGET to update Equals() and DeepCopy() if you add new fields
 type BackupPolicy struct {
 	RetryDelayMS  uint32     `json:"retry_delay_ms"`
 	StopPolicy    StopPolicy `json:"stop_policy"`
 	RetrySameNode bool       `json:"retry_same_node"`
+}
+
+// MixedPolicy for failure retry
+// DON'T FORGET to update Equals() and DeepCopy() if you add new fields
+type MixedPolicy struct {
+	RetryDelayMS uint32 `json:"retry_delay_ms"`
+	FailurePolicy
 }
 
 // StopPolicy is a group policies to decide when stop retry
@@ -119,6 +145,7 @@ type CBPolicy struct {
 }
 
 // BackOffPolicy is the BackOff policy.
+// DON'T FORGET to update Equals() and DeepCopy() if you add new fields
 type BackOffPolicy struct {
 	BackOffType BackOffType               `json:"backoff_type"`
 	CfgItems    map[BackOffCfgKey]float64 `json:"cfg_items,omitempty"`
@@ -148,8 +175,18 @@ const (
 
 // ShouldResultRetry is used for specifying which error or resp need to be retried
 type ShouldResultRetry struct {
+	// ErrorRetryWithCtx is added in v0.10.0, passing ctx is more convenient for user
+	ErrorRetryWithCtx func(ctx context.Context, err error, ri rpcinfo.RPCInfo) bool
+	// RespRetryWithCtx is added in v0.10.0, passing ctx is more convenient for user
+	RespRetryWithCtx func(ctx context.Context, resp interface{}, ri rpcinfo.RPCInfo) bool
+
+	// Deprecated: please use ErrorRetryWithCtx instead of ErrorRetry
 	ErrorRetry func(err error, ri rpcinfo.RPCInfo) bool
-	RespRetry  func(resp interface{}, ri rpcinfo.RPCInfo) bool
+	// Deprecated: please use RespRetryWithCtx instead of RespRetry
+	RespRetry func(resp interface{}, ri rpcinfo.RPCInfo) bool
+
+	// disable the default timeout retry in specific scenarios (e.g. the requests are not non-idempotent)
+	NotRetryForTimeout bool
 }
 
 // Equals to check if policy is equal
@@ -166,49 +203,9 @@ func (p Policy) Equals(np Policy) bool {
 	if !p.BackupPolicy.Equals(np.BackupPolicy) {
 		return false
 	}
-	return true
-}
-
-// Equals to check if FailurePolicy is equal
-func (p *FailurePolicy) Equals(np *FailurePolicy) bool {
-	if p == nil {
-		return np == nil
-	}
-	if np == nil {
+	if !p.MixedPolicy.Equals(np.MixedPolicy) {
 		return false
 	}
-	if p.StopPolicy != np.StopPolicy {
-		return false
-	}
-	if !p.BackOffPolicy.Equals(np.BackOffPolicy) {
-		return false
-	}
-	if p.RetrySameNode != np.RetrySameNode {
-		return false
-	}
-	// don't need to check `ShouldResultRetry`, ShouldResultRetry is only setup by option
-	// in remote config case will always return false if check it
-	return true
-}
-
-// Equals to check if BackupPolicy is equal
-func (p *BackupPolicy) Equals(np *BackupPolicy) bool {
-	if p == nil {
-		return np == nil
-	}
-	if np == nil {
-		return false
-	}
-	if p.RetryDelayMS != np.RetryDelayMS {
-		return false
-	}
-	if p.StopPolicy != np.StopPolicy {
-		return false
-	}
-	if p.RetrySameNode != np.RetrySameNode {
-		return false
-	}
-
 	return true
 }
 
@@ -235,9 +232,47 @@ func (p *BackOffPolicy) Equals(np *BackOffPolicy) bool {
 	return true
 }
 
+func (p *BackOffPolicy) DeepCopy() *BackOffPolicy {
+	if p == nil {
+		return nil
+	}
+	return &BackOffPolicy{
+		BackOffType: p.BackOffType,
+		CfgItems:    p.copyCfgItems(),
+	}
+}
+
+func (p *BackOffPolicy) copyCfgItems() map[BackOffCfgKey]float64 {
+	if p.CfgItems == nil {
+		return nil
+	}
+	cfgItems := make(map[BackOffCfgKey]float64, len(p.CfgItems))
+	for k, v := range p.CfgItems {
+		cfgItems[k] = v
+	}
+	return cfgItems
+}
+
+func (rr *ShouldResultRetry) IsValid() bool {
+	return rr.ErrorRetryWithCtx != nil || rr.RespRetryWithCtx != nil || rr.RespRetry != nil || rr.ErrorRetry != nil
+}
+
 func checkCBErrorRate(p *CBPolicy) error {
 	if p.ErrorRate <= 0 || p.ErrorRate > 0.3 {
 		return fmt.Errorf("invalid retry circuit breaker rate, errRate=%0.2f", p.ErrorRate)
+	}
+	return nil
+}
+
+func checkStopPolicy(sp *StopPolicy, maxRetryTimes int, retryer Retryer) error {
+	rt := sp.MaxRetryTimes
+	// 0 is valid, it means stop retry
+	if rt < 0 || rt > maxRetryTimes {
+		return fmt.Errorf("invalid MaxRetryTimes[%d]", rt)
+	}
+	if e := checkCBErrorRate(&sp.CBPolicy); e != nil {
+		sp.CBPolicy.ErrorRate = defaultCBErrRate
+		klog.Warnf("KITEX: %s retry - %s, use default %0.2f", retryer.Type(), e.Error(), defaultCBErrRate)
 	}
 	return nil
 }

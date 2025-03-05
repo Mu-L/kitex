@@ -55,6 +55,18 @@ func TestByteBuffer(t *testing.T) {
 	test.Assert(t, err == nil)
 }
 
+func TestByteBuffer_Read(t *testing.T) {
+	const teststr = "testing"
+	buf := &bytes.Buffer{}
+	buf.WriteString(teststr)
+	r := NewReaderByteBuffer(netpoll.NewReader(buf))
+	b := make([]byte, len(teststr)+1)
+	n, err := r.Read(b)
+	test.Assert(t, err == nil, err)
+	test.Assert(t, n == len(teststr), n)
+	test.Assert(t, string(b[:n]) == teststr)
+}
+
 // TestWriterBuffer test writerbytebufferr return writedirect err
 func TestWriterBuffer(t *testing.T) {
 	// 1. prepare mock data
@@ -98,7 +110,7 @@ func checkWritable(t *testing.T, buf remote.ByteBuffer) {
 	test.Assert(t, len(p) == len(msg))
 	copy(p, msg)
 
-	l := buf.MallocLen()
+	l := buf.WrittenLen()
 	test.Assert(t, l == len(msg))
 
 	l, err = buf.WriteString(msg)
@@ -138,7 +150,8 @@ func checkReadable(t *testing.T, buf remote.ByteBuffer) {
 	test.Assert(t, err == nil, err)
 	test.Assert(t, s == msg)
 
-	p, err = buf.ReadBinary(len(msg))
+	p = make([]byte, len(msg))
+	_, err = buf.ReadBinary(p)
 	test.Assert(t, err == nil, err)
 	test.Assert(t, string(p) == msg)
 }
@@ -150,7 +163,7 @@ func checkUnwritable(t *testing.T, buf remote.ByteBuffer) {
 	_, err := buf.Malloc(len(msg))
 	test.Assert(t, err != nil)
 
-	l := buf.MallocLen()
+	l := buf.WrittenLen()
 	test.Assert(t, l == -1, l)
 
 	_, err = buf.WriteString(msg)
@@ -193,7 +206,8 @@ func checkUnreadable(t *testing.T, buf remote.ByteBuffer) {
 	_, err = buf.ReadString(len(msg))
 	test.Assert(t, err != nil)
 
-	_, err = buf.ReadBinary(len(msg))
+	b := make([]byte, len(msg))
+	_, err = buf.ReadBinary(b)
 	test.Assert(t, err != nil)
 
 	n, err = buf.Read(p)

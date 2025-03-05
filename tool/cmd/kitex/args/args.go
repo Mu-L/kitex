@@ -15,11 +15,13 @@
 package args
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -28,6 +30,7 @@ import (
 	"github.com/cloudwego/kitex/tool/internal_pkg/pluginmode/protoc"
 	"github.com/cloudwego/kitex/tool/internal_pkg/pluginmode/thriftgo"
 	"github.com/cloudwego/kitex/tool/internal_pkg/util"
+	"github.com/cloudwego/kitex/transport"
 )
 
 // EnvPluginMode is an environment that kitex uses to distinguish run modes.
@@ -41,8 +44,7 @@ type ExtraFlag struct {
 
 	// check may perform any value checking for flags added by apply above.
 	// When an error occur, check should directly terminate the program by
-	// os.Exit with exit code 1 for internal error and 2 for invalid arguments.
-	Check func(*Arguments)
+	Check func(*Arguments) error
 }
 
 // Arguments .
@@ -94,33 +96,58 @@ func (a *Arguments) buildFlags(version string) *flag.FlagSet {
 	f.StringVar(&a.IDLType, "type", "unknown", "Specify the type of IDL: 'thrift' or 'protobuf'.")
 	f.Var(&a.Includes, "I", "Add an IDL search path for includes.")
 	f.Var(&a.ThriftOptions, "thrift", "Specify arguments for the thrift go compiler.")
+	f.Var(&a.Hessian2Options, "hessian2", "Specify arguments for the hessian2 codec.")
 	f.DurationVar(&a.ThriftPluginTimeLimit, "thrift-plugin-time-limit", generator.DefaultThriftPluginTimeLimit, "Specify thrift plugin execution time limit.")
+	f.StringVar(&a.CompilerPath, "compiler-path", "", "Specify the path of thriftgo/protoc.")
 	f.Var(&a.ThriftPlugins, "thrift-plugin", "Specify thrift plugin arguments for the thrift compiler.")
 	f.Var(&a.ProtobufOptions, "protobuf", "Specify arguments for the protobuf compiler.")
+	f.Var(&a.ProtobufPlugins, "protobuf-plugin", "Specify protobuf plugin arguments for the protobuf compiler.(plugin_name:options:out_dir)")
 	f.BoolVar(&a.CombineService, "combine-service", false,
 		"Combine services in root thrift file.")
 	f.BoolVar(&a.CopyIDL, "copy-idl", false,
 		"Copy each IDL file to the output path.")
+	f.BoolVar(&a.HandlerReturnKeepResp, "handler-return-keep-resp", false,
+		"When the server-side handler returns both err and resp, the resp return is retained for use in middleware where both err and resp can be used simultaneously. Note: At the RPC communication level, if the handler returns an err, the framework still only returns err to the client without resp.")
 	f.StringVar(&a.ExtensionFile, "template-extension", a.ExtensionFile,
 		"Specify a file for template extension.")
 	f.BoolVar(&a.FrugalPretouch, "frugal-pretouch", false,
 		"Use frugal to compile arguments and results when new clients and servers.")
 	f.BoolVar(&a.Record, "record", false,
 		"Record Kitex cmd into kitex-all.sh.")
-	a.RecordCmd = os.Args
+	f.StringVar(&a.TemplateDir, "template-dir", "",
+		"Use custom template to generate codes.")
+	f.StringVar(&a.GenPath, "gen-path", generator.KitexGenPath,
+		"Specify a code gen path.")
+	f.BoolVar(&a.DeepCopyAPI, "deep-copy-api", false,
+		"Generate codes with injecting deep copy method.")
+	f.StringVar(&a.Protocol, "protocol", "",
+		"Specify a protocol for codec")
+	f.BoolVar(&a.NoDependencyCheck, "no-dependency-check", false,
+		"Skip dependency checking.")
+	f.BoolVar(&a.LocalThriftgo, "local-thriftgo", false,
+		"Use local thriftgo exec instead of kitex embedded thriftgo. This is mainly used for debugging, you need to ensure that thriftgo is installed correctly.")
+	f.Var(&a.BuiltinTpl, "tpl", "Specify kitex built-in template.")
+	f.BoolVar(&a.StreamX, "streamx", false,
+		"Generate streaming code with streamx interface",
+	)
+
+	f.Var(&a.FrugalStruct, "frugal-struct", "Replace fastCodec code to frugal. Use `-frugal-struct @all` for all, `-frugal-struct @auto` for annotated structs (go.codec=\"frugal\"), or specify multiple structs (e.g., `-frugal-struct A -frugal-struct B`).")
+
+	f.BoolVar(&a.NoRecurse, "no-recurse", false, `Don't generate thrift files recursively, just generate the given file.'`)
+
 	a.Version = version
 	a.ThriftOptions = append(a.ThriftOptions,
 		"naming_style=golint",
 		"ignore_initialisms",
 		"gen_setter",
-		"gen_deep_equal",
+		"validate_set=false",
+		"gen_deep_equal=false",
 		"compatible_names",
 		"frugal_tag",
+		"thrift_streaming",
+		"no_processor",
 	)
 
-	for _, e := range a.extends {
-		e.Apply(f)
-	}
 	f.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Version %s
 Usage: %s [flags] IDL
@@ -130,38 +157,70 @@ Examples:
 Flags:
 `, a.Version, os.Args[0], cmdExample)
 		f.PrintDefaults()
-		os.Exit(1)
 	}
+
+	for _, e := range a.extends {
+		e.Apply(f)
+	}
+
 	return f
 }
 
 // ParseArgs parses command line arguments.
-func (a *Arguments) ParseArgs(version string) {
+func (a *Arguments) ParseArgs(version, curpath string, kitexArgs []string) (err error) {
 	f := a.buildFlags(version)
-	if err := f.Parse(os.Args[1:]); err != nil {
-		log.Warn(os.Stderr, err)
-		os.Exit(2)
+	if err = f.Parse(kitexArgs); err != nil {
+		return err
 	}
+
+	if a.Record {
+		a.RecordCmd = os.Args
+	}
+
+	// format -thrift xxx,xxx to -thrift xx -thrift xx
+	thriftOptions := make([]string, len(a.ThriftOptions))
+	for i := range a.ThriftOptions {
+		op := a.ThriftOptions[i]
+		thriftOptions = append(thriftOptions, strings.Split(op, ",")...)
+	}
+	a.ThriftOptions = thriftOptions
 
 	log.Verbose = a.Verbose
 
 	for _, e := range a.extends {
-		e.Check(a)
+		err = e.Check(a)
+		if err != nil {
+			return err
+		}
 	}
 
-	a.checkIDL(f.Args())
-	a.checkServiceName()
-	a.checkPath()
+	err = a.checkIDL(f.Args())
+	if err != nil {
+		return err
+	}
+	err = a.checkServiceName()
+	if err != nil {
+		return err
+	}
+	err = a.checkStreamX()
+	if err != nil {
+		return err
+	}
+	// todo finish protobuf
+	if a.IDLType != "thrift" {
+		a.GenPath = generator.KitexGenPath
+	}
+	return a.checkPath(curpath)
 }
 
-func (a *Arguments) checkIDL(files []string) {
+func (a *Arguments) checkIDL(files []string) error {
 	if len(files) == 0 {
-		log.Warn("No IDL file found.")
-		os.Exit(2)
+		return fmt.Errorf("no IDL file found; Please make your IDL file the last parameter, for example: " +
+			"\"kitex -service demo idl.thrift\"")
 	}
 	if len(files) != 1 {
-		log.Warn("Require exactly 1 IDL file.")
-		os.Exit(2)
+		return fmt.Errorf("require exactly 1 IDL file; Please make your IDL file the last parameter, for example: " +
+			"\"kitex -service demo idl.thrift\"")
 	}
 	a.IDL = files[0]
 
@@ -171,78 +230,109 @@ func (a *Arguments) checkIDL(files []string) {
 		if typ, ok := a.guessIDLType(); ok {
 			a.IDLType = typ
 		} else {
-			log.Warn("Can not guess an IDL type from %q, please specify with the '-type' flag.", a.IDL)
-			os.Exit(2)
+			return fmt.Errorf("can not guess an IDL type from %q (unknown suffix), please specify with the '-type' flag", a.IDL)
 		}
 	default:
-		log.Warn("Unsupported IDL type:", a.IDLType)
-		os.Exit(2)
+		return fmt.Errorf("unsupported IDL type: %s", a.IDLType)
 	}
+	return nil
 }
 
-func (a *Arguments) checkServiceName() {
-	if a.ServiceName == "" {
+func (a *Arguments) checkServiceName() error {
+	if a.ServiceName == "" && a.TemplateDir == "" {
 		if a.Use != "" {
-			log.Warn("-use must be used with -service")
-			os.Exit(2)
+			return fmt.Errorf("-use must be used with -service or -template-dir")
 		}
-	} else {
+	}
+	if a.ServiceName != "" && a.TemplateDir != "" {
+		return fmt.Errorf("-template-dir and -service cannot be specified at the same time")
+	}
+	if a.ServiceName != "" {
 		a.GenerateMain = true
 	}
+	return nil
 }
 
-func (a *Arguments) checkPath() {
-	pathToGo, err := exec.LookPath("go")
+func (a *Arguments) checkStreamX() error {
+	if !a.StreamX {
+		return nil
+	}
+	if a.IDLType == "thrift" {
+		// set TTHeader Streaming by default
+		a.Protocol = transport.TTHeader.String()
+	}
+	// todo(DMwangnima): process pb and gRPC
+	return nil
+}
+
+// refGoSrcPath returns ref path to curpath, base path is $GOPATH/src
+func refGoSrcPath(curpath string) (string, bool) {
+	gopath, err := util.GetGOPATH()
 	if err != nil {
-		log.Warn(err)
-		os.Exit(1)
+		return "", false
+	}
+	gosrc, err := filepath.Abs(filepath.Join(gopath, "src"))
+	if err != nil {
+		return "", false
+	}
+	// if curpath is NOT under gosrc
+	if !strings.HasPrefix(curpath, gosrc) {
+		return "", false
+	}
+	ret, err := filepath.Rel(gosrc, curpath)
+	if err != nil {
+		return "", false
+	}
+	return ret, true
+}
+
+func (a *Arguments) checkPath(curpath string) error {
+	genPath := filepath.ToSlash(a.GenPath) // for PackagePrefix
+	usingGOPATH := false
+
+	// Try to get ref path to $GOPARH/src for PackagePrefix
+	// Deprecated: to be removed in the future
+	if ref, ok := refGoSrcPath(curpath); ok {
+		usingGOPATH = true
+		a.PackagePrefix = path.Join(filepath.ToSlash(ref), genPath)
 	}
 
-	gosrc := filepath.Join(util.GetGOPATH(), "src")
-	gosrc, err = filepath.Abs(gosrc)
-	if err != nil {
-		log.Warn("Get GOPATH/src path failed:", err.Error())
-		os.Exit(1)
-	}
-	curpath, err := filepath.Abs(".")
-	if err != nil {
-		log.Warn("Get current path failed:", err.Error())
-		os.Exit(1)
+	goMod, goModPath, hasGoMod := util.SearchGoMod(curpath)
+	if usingGOPATH && a.ModuleName == "" && !hasGoMod {
+		log.Warn("You're relying on $GOPATH for generating code.\n" +
+			"Please add go.mod or specify -module for module path.\n" +
+			"We will deprecate $GOPATH support in the near future!")
 	}
 
-	if strings.HasPrefix(curpath, gosrc) {
-		if a.PackagePrefix, err = filepath.Rel(gosrc, curpath); err != nil {
-			log.Warn("Get GOPATH/src relpath failed:", err.Error())
-			os.Exit(1)
-		}
-		a.PackagePrefix = filepath.Join(a.PackagePrefix, generator.KitexGenPath)
-	} else {
-		if a.ModuleName == "" {
-			log.Warn("Outside of $GOPATH. Please specify a module name with the '-module' flag.")
-			os.Exit(1)
+	if !usingGOPATH && a.ModuleName == "" {
+		// try to update a.ModuleName with module name from go.mod
+		if hasGoMod {
+			a.ModuleName = goMod
+		} else {
+			// case:
+			// * -module not set
+			// * not under $GOPATH/src
+			// * go.mod not found
+			return errors.New("go.mod not found. Please specify a module name with the '-module' flag")
 		}
 	}
 
 	if a.ModuleName != "" {
-		module, path, ok := util.SearchGoMod(curpath)
-		if ok {
-			// go.mod exists
-			if module != a.ModuleName {
-				log.Warnf("The module name given by the '-module' option ('%s') is not consist with the name defined in go.mod ('%s' from %s)\n",
-					a.ModuleName, module, path)
-				os.Exit(1)
+		if hasGoMod {
+			if goMod != a.ModuleName {
+				return fmt.Errorf("the module name given by the '-module' option ('%s') is not consist with the name defined in go.mod ('%s' from %s)",
+					a.ModuleName, goMod, goModPath)
 			}
-			if a.PackagePrefix, err = filepath.Rel(path, curpath); err != nil {
-				log.Warn("Get package prefix failed:", err.Error())
-				os.Exit(1)
+			refPath, err := filepath.Rel(goModPath, curpath)
+			if err != nil {
+				return fmt.Errorf("get package prefix failed: %w", err)
 			}
-			a.PackagePrefix = filepath.Join(a.ModuleName, a.PackagePrefix, generator.KitexGenPath)
+			a.PackagePrefix = path.Join(a.ModuleName, filepath.ToSlash(refPath), genPath)
 		} else {
-			if err = initGoMod(pathToGo, a.ModuleName); err != nil {
-				log.Warn("Init go mod failed:", err.Error())
-				os.Exit(1)
+			if err := initGoMod(curpath, a.ModuleName); err != nil {
+				return fmt.Errorf("init go mod failed: %w", err)
 			}
-			a.PackagePrefix = filepath.Join(a.ModuleName, generator.KitexGenPath)
+			a.PackagePrefix = path.Join(a.ModuleName, genPath)
 		}
 	}
 
@@ -250,14 +340,14 @@ func (a *Arguments) checkPath() {
 		a.PackagePrefix = a.Use
 	}
 	a.OutputPath = curpath
+	return nil
 }
 
 // BuildCmd builds an exec.Cmd.
-func (a *Arguments) BuildCmd(out io.Writer) *exec.Cmd {
+func (a *Arguments) BuildCmd(out io.Writer) (*exec.Cmd, error) {
 	exe, err := os.Executable()
 	if err != nil {
-		log.Warn("Failed to detect current executable:", err.Error())
-		os.Exit(1)
+		return nil, fmt.Errorf("failed to detect current executable: %s", err.Error())
 	}
 
 	for i, inc := range a.Includes {
@@ -267,36 +357,48 @@ func (a *Arguments) BuildCmd(out io.Writer) *exec.Cmd {
 				if errMsg == "" {
 					errMsg = gitErr.Error()
 				}
-				log.Warn("Failed to pull IDL from git:", errMsg)
-				os.Exit(1)
+				return nil, fmt.Errorf("failed to pull IDL from git:%s\nYou can execute 'rm -rf ~/.kitex' to clean the git cache and try again", errMsg)
 			}
 			a.Includes[i] = localGitPath
 		}
 	}
 
-	kas := strings.Join(a.Config.Pack(), ",")
+	configkv := a.Config.Pack()
+	kas := strings.Join(configkv, ",")
 	cmd := &exec.Cmd{
-		Path:   lookupTool(a.IDLType),
+		Path:   LookupTool(a.IDLType, a.CompilerPath),
 		Stdin:  os.Stdin,
 		Stdout: io.MultiWriter(out, os.Stdout),
 		Stderr: io.MultiWriter(out, os.Stderr),
 	}
+
 	if a.IDLType == "thrift" {
 		os.Setenv(EnvPluginMode, thriftgo.PluginName)
 		cmd.Args = append(cmd.Args, "thriftgo")
 		for _, inc := range a.Includes {
 			cmd.Args = append(cmd.Args, "-i", inc)
 		}
+		if thriftgo.IsHessian2(a.Config) {
+			err = thriftgo.Hessian2PreHook(&a.Config)
+			if err != nil {
+				return nil, err
+			}
+		}
 		a.ThriftOptions = append(a.ThriftOptions, "package_prefix="+a.PackagePrefix)
+
+		// see README.md in `bthrift`
+		a.ThriftOptions = append(a.ThriftOptions,
+			"thrift_import_path=github.com/cloudwego/kitex/pkg/protocol/bthrift/apache")
+
 		gas := "go:" + strings.Join(a.ThriftOptions, ",")
 		if a.Verbose {
 			cmd.Args = append(cmd.Args, "-v")
 		}
-		if a.Use == "" {
+		if a.Use == "" && !a.NoRecurse {
 			cmd.Args = append(cmd.Args, "-r")
 		}
 		cmd.Args = append(cmd.Args,
-			"-o", generator.KitexGenPath,
+			"-o", a.GenPath,
 			"-g", gas,
 			"-p", "kitex="+exe+":"+kas,
 		)
@@ -317,7 +419,7 @@ func (a *Arguments) BuildCmd(out io.Writer) *exec.Cmd {
 		for _, inc := range a.Includes {
 			cmd.Args = append(cmd.Args, "-I", inc)
 		}
-		outPath := filepath.Join(".", generator.KitexGenPath)
+		outPath := util.JoinPath(".", a.GenPath)
 		if a.Use == "" {
 			os.MkdirAll(outPath, 0o755)
 		} else {
@@ -331,32 +433,72 @@ func (a *Arguments) BuildCmd(out io.Writer) *exec.Cmd {
 		for _, po := range a.ProtobufOptions {
 			cmd.Args = append(cmd.Args, "--kitex_opt="+po)
 		}
+		for _, p := range a.ProtobufPlugins {
+			pluginParams := strings.Split(p, ":")
+			if len(pluginParams) != 3 {
+				return nil, fmt.Errorf("failed to get the correct protoc plugin parameters for %s. Please specify the protoc plugin in the form of \"plugin_name:options:out_dir\"", p)
+			}
+			// pluginParams[0] -> plugin name, pluginParams[1] -> plugin options, pluginParams[2] -> out_dir
+			cmd.Args = append(cmd.Args,
+				fmt.Sprintf("--%s_out=%s", pluginParams[0], pluginParams[2]),
+				fmt.Sprintf("--%s_opt=%s", pluginParams[0], pluginParams[1]),
+			)
+		}
+
 		cmd.Args = append(cmd.Args, a.IDL)
 	}
-	log.Info(strings.ReplaceAll(strings.Join(cmd.Args, " "), kas, fmt.Sprintf("%q", kas)))
-	return cmd
+	log.Debugf("cmd.Args %v", cmd.Args)
+	log.Debugf("config pairs %v", configkv)
+	return cmd, nil
 }
 
-func lookupTool(idlType string) string {
+// ValidateCMD check if the path exists and if the version is satisfied. Thriftgo is embedded, only validate protoc.
+func ValidateCMD(path, idlType string) error {
+	if idlType == "protobuf" {
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("[ERROR] %s is also unavailable, please install protoc first.\n"+
+				"Refer to https://github.com/protocolbuffers/protobuf", path)
+		}
+	}
+	if idlType == "thrift" {
+		log.Warnf("You are using local thriftgo: %s. Please make sure the version is matched with kitex tool by yourself.", path)
+	}
+	return nil
+}
+
+// LookupTool returns the compiler path found in $PATH; if not found, returns $GOPATH/bin/$tool
+func LookupTool(idlType, compilerPath string) string {
 	tool := "thriftgo"
 	if idlType == "protobuf" {
 		tool = "protoc"
 	}
+	if compilerPath != "" {
+		log.Debugf("Will use the specified %s: %s\n", tool, compilerPath)
+		return compilerPath
+	}
 
 	path, err := exec.LookPath(tool)
 	if err != nil {
-		log.Warnf("Failed to find %q from $PATH: %s. Try $GOPATH/bin/%s instead\n", path, err.Error(), tool)
-		path = filepath.Join(util.GetGOPATH(), "bin", tool)
+		// log.Warnf("Failed to find %q from $PATH: %s.\nTry $GOPATH/bin/%s instead\n", path, err.Error(), tool)
+		gopath, er := util.GetGOPATH()
+		if er != nil {
+			return ""
+		}
+		path = util.JoinPath(gopath, "bin", tool)
 	}
 	return path
 }
 
-func initGoMod(pathToGo, module string) error {
+func initGoMod(curpath, module string) error {
 	if util.Exists("go.mod") {
 		return nil
 	}
-
+	pathToGo, err := exec.LookPath("go")
+	if err != nil {
+		return err
+	}
 	cmd := &exec.Cmd{
+		Dir:    curpath,
 		Path:   pathToGo,
 		Args:   []string{"go", "mod", "init", module},
 		Stdin:  os.Stdin,

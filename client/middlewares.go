@@ -20,15 +20,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
-
-	"github.com/apache/thrift/lib/go/thrift"
 
 	"github.com/cloudwego/kitex/internal"
 	"github.com/cloudwego/kitex/pkg/discovery"
 	"github.com/cloudwego/kitex/pkg/endpoint"
 	"github.com/cloudwego/kitex/pkg/event"
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/loadbalance/lbcache"
 	"github.com/cloudwego/kitex/pkg/proxy"
 	"github.com/cloudwego/kitex/pkg/remote"
@@ -37,7 +38,14 @@ import (
 	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
 )
 
+const maxRetry = 6
+
 func newProxyMW(prx proxy.ForwardProxy) endpoint.Middleware {
+	// If you want to customize the processing logic of proxy middleware,
+	// you can implement this interface to replace the default implementation.
+	if p, ok := prx.(proxy.WithMiddleware); ok {
+		return p.ProxyMiddleware()
+	}
 	return func(next endpoint.Endpoint) endpoint.Endpoint {
 		return func(ctx context.Context, request, response interface{}) error {
 			err := prx.ResolveProxyInstance(ctx)
@@ -62,9 +70,11 @@ func discoveryEventHandler(name string, bus event.Bus, queue event.Queue) func(d
 			Name: name,
 			Time: now,
 			Extra: map[string]interface{}{
-				"Added":   wrapInstances(d.Added),
-				"Updated": wrapInstances(d.Updated),
-				"Removed": wrapInstances(d.Removed),
+				"Cacheable": d.Result.Cacheable,
+				"CacheKey":  d.Result.CacheKey,
+				"Added":     wrapInstances(d.Added),
+				"Updated":   wrapInstances(d.Updated),
+				"Removed":   wrapInstances(d.Removed),
 			},
 		})
 	}
@@ -75,10 +85,6 @@ func discoveryEventHandler(name string, bus event.Bus, queue event.Queue) func(d
 // If retryable error is encountered, it will retry until timeout or an unretryable error is returned.
 func newResolveMWBuilder(lbf *lbcache.BalancerFactory) endpoint.MiddlewareBuilder {
 	return func(ctx context.Context) endpoint.Middleware {
-		retryable := func(err error) bool {
-			return errors.Is(err, kerrors.ErrGetConnection) || errors.Is(err, kerrors.ErrCircuitBreak)
-		}
-
 		return func(next endpoint.Endpoint) endpoint.Endpoint {
 			return func(ctx context.Context, request, response interface{}) error {
 				rpcInfo := rpcinfo.GetRPCInfo(ctx)
@@ -101,38 +107,46 @@ func newResolveMWBuilder(lbf *lbcache.BalancerFactory) endpoint.MiddlewareBuilde
 					return kerrors.ErrServiceDiscovery.WithCause(err)
 				}
 
-				picker := lb.GetPicker()
-				if r, ok := picker.(internal.Reusable); ok {
-					defer r.Recycle()
-				}
 				var lastErr error
-				for {
+				for i := 0; i < maxRetry; i++ {
 					select {
 					case <-ctx.Done():
 						return kerrors.ErrRPCTimeout
 					default:
 					}
 
+					// we always need to get a new picker every time, because when downstream update deployment,
+					// we may get an old picker that include all outdated instances which will cause connect always failed.
+					picker := lb.GetPicker()
 					ins := picker.Next(ctx, request)
 					if ins == nil {
-						return kerrors.ErrNoMoreInstance.WithCause(fmt.Errorf("last error: %w", lastErr))
+						err = kerrors.ErrNoMoreInstance.WithCause(fmt.Errorf("last error: %w", lastErr))
+					} else {
+						remote.SetInstance(ins)
+						// TODO: generalize retry strategy
+						err = next(ctx, request, response)
 					}
-					remote.SetInstance(ins)
-
-					// TODO: generalize retry strategy
-					if err = next(ctx, request, response); err != nil && retryable(err) {
+					if r, ok := picker.(internal.Reusable); ok {
+						r.Recycle()
+					}
+					if err == nil {
+						return nil
+					}
+					if retryable(err) {
 						lastErr = err
+						klog.CtxWarnf(ctx, "KITEX: auto retry retryable error, retry=%d error=%s", i+1, err.Error())
 						continue
 					}
 					return err
 				}
+				return lastErr
 			}
 		}
 	}
 }
 
 // newIOErrorHandleMW provides a hook point for io error handling.
-func newIOErrorHandleMW(errHandle func(error) error) endpoint.Middleware {
+func newIOErrorHandleMW(errHandle func(context.Context, error) error) endpoint.Middleware {
 	if errHandle == nil {
 		errHandle = DefaultClientErrorHandler
 	}
@@ -142,23 +156,52 @@ func newIOErrorHandleMW(errHandle func(error) error) endpoint.Middleware {
 			if err == nil {
 				return
 			}
-			return errHandle(err)
+			return errHandle(ctx, err)
 		}
 	}
+}
+
+func isRemoteErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch err.(type) {
+	// for thrift、KitexProtobuf, actually check *remote.TransError is enough
+	case *remote.TransError, protobuf.PBError:
+		return true
+	default:
+		// case thrift.TApplicationException ?
+		// XXX: we'd like to get rid of apache pkg, should be ok to check by type name
+		// for thrift v0.13.0, it's "*thrift.tApplicationException"
+	}
+	return strings.HasSuffix(reflect.TypeOf(err).String(), "ApplicationException")
 }
 
 // DefaultClientErrorHandler is Default ErrorHandler for client
 // when no ErrorHandler is specified with Option `client.WithErrorHandler`, this ErrorHandler will be injected.
 // for thrift、KitexProtobuf, >= v0.4.0 wrap protocol error to TransError, which will be more friendly.
-func DefaultClientErrorHandler(err error) error {
-	switch err.(type) {
-	// for thrift、KitexProtobuf, actually check *remote.TransError is enough
-	case *remote.TransError, thrift.TApplicationException, protobuf.PBError:
+func DefaultClientErrorHandler(ctx context.Context, err error) error {
+	if isRemoteErr(err) {
 		// Add 'remote' prefix to distinguish with local err.
 		// Because it cannot make sure which side err when decode err happen
 		return kerrors.ErrRemoteOrNetwork.WithCauseAndExtraMsg(err, "remote")
 	}
 	return kerrors.ErrRemoteOrNetwork.WithCause(err)
+}
+
+// ClientErrorHandlerWithAddr is ErrorHandler for client, which will add remote addr info into error
+func ClientErrorHandlerWithAddr(ctx context.Context, err error) error {
+	addrStr := getRemoteAddr(ctx)
+	if isRemoteErr(err) {
+		// Add 'remote' prefix to distinguish with local err.
+		// Because it cannot make sure which side err when decode err happen
+		extraMsg := "remote"
+		if addrStr != "" {
+			extraMsg = "remote-" + addrStr
+		}
+		return kerrors.ErrRemoteOrNetwork.WithCauseAndExtraMsg(err, extraMsg)
+	}
+	return kerrors.ErrRemoteOrNetwork.WithCauseAndExtraMsg(err, addrStr)
 }
 
 type instInfo struct {
@@ -177,4 +220,15 @@ func wrapInstances(insts []discovery.Instance) []*instInfo {
 		instInfos = append(instInfos, &instInfo{Address: addr, Weight: inst.Weight()})
 	}
 	return instInfos
+}
+
+func retryable(err error) bool {
+	return errors.Is(err, kerrors.ErrGetConnection) || errors.Is(err, kerrors.ErrCircuitBreak)
+}
+
+func getRemoteAddr(ctx context.Context) string {
+	if ri := rpcinfo.GetRPCInfo(ctx); ri != nil && ri.To() != nil && ri.To().Address() != nil {
+		return ri.To().Address().String()
+	}
+	return ""
 }

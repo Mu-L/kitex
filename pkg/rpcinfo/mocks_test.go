@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
 	"github.com/cloudwego/kitex/transport"
 )
@@ -35,6 +36,11 @@ type MockRPCConfig struct {
 	IOBufferSizeFunc      func() (r int)
 	TransportProtocolFunc func() transport.Protocol
 	InteractionModeFunc   func() (r rpcinfo.InteractionMode)
+}
+
+func (m *MockRPCConfig) PayloadCodec() serviceinfo.PayloadCodec {
+	// TODO implement me
+	panic("implement me")
 }
 
 func (m *MockRPCConfig) InteractionMode() (r rpcinfo.InteractionMode) {
@@ -84,6 +90,10 @@ func (m *MockRPCConfig) TransportProtocol() (r transport.Protocol) {
 	return
 }
 
+func (m *MockRPCConfig) StreamRecvTimeout() time.Duration {
+	return time.Duration(0)
+}
+
 type MockRPCStats struct{}
 
 func (m *MockRPCStats) Record(context.Context, stats.Event, stats.Status, string) {}
@@ -93,3 +103,6 @@ func (m *MockRPCStats) Error() error                                            
 func (m *MockRPCStats) Panicked() (yes bool, val interface{})                     { return }
 func (m *MockRPCStats) GetEvent(event stats.Event) (e rpcinfo.Event)              { return }
 func (m *MockRPCStats) Level() (lv stats.Level)                                   { return }
+func (m *MockRPCStats) CopyForRetry() rpcinfo.RPCStats                            { return nil }
+func (m *MockRPCStats) LastSendSize() uint64                                      { return 0 }
+func (m *MockRPCStats) LastRecvSize() uint64                                      { return 0 }

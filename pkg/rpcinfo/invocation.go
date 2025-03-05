@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
 var (
@@ -39,17 +40,20 @@ type InvocationSetter interface {
 	SetPackageName(name string)
 	SetServiceName(name string)
 	SetMethodName(name string)
+	SetStreamingMode(mode serviceinfo.StreamingMode)
 	SetSeqID(seqID int32)
 	SetBizStatusErr(err kerrors.BizStatusErrorIface)
+	SetExtra(key string, value interface{})
 	Reset()
 }
-
 type invocation struct {
-	packageName string
-	serviceName string
-	methodName  string
-	seqID       int32
-	bizErr      kerrors.BizStatusErrorIface
+	packageName   string
+	serviceName   string
+	methodName    string
+	streamingMode serviceinfo.StreamingMode
+	seqID         int32
+	bizErr        kerrors.BizStatusErrorIface
+	extra         map[string]interface{}
 }
 
 // NewInvocation creates a new Invocation with the given service, method and optional package.
@@ -120,6 +124,16 @@ func (i *invocation) SetMethodName(name string) {
 	i.methodName = name
 }
 
+// StreamingMode implements the Invocation interface.
+func (i *invocation) StreamingMode() serviceinfo.StreamingMode {
+	return i.streamingMode
+}
+
+// SetStreamingMode implements the InvocationSetter interface.
+func (i *invocation) SetStreamingMode(mode serviceinfo.StreamingMode) {
+	i.streamingMode = mode
+}
+
 // BizStatusErr implements the Invocation interface.
 func (i *invocation) BizStatusErr() kerrors.BizStatusErrorIface {
 	return i.bizErr
@@ -128,6 +142,20 @@ func (i *invocation) BizStatusErr() kerrors.BizStatusErrorIface {
 // SetBizStatusErr implements the InvocationSetter interface.
 func (i *invocation) SetBizStatusErr(err kerrors.BizStatusErrorIface) {
 	i.bizErr = err
+}
+
+func (i *invocation) SetExtra(key string, value interface{}) {
+	if i.extra == nil {
+		i.extra = map[string]interface{}{}
+	}
+	i.extra[key] = value
+}
+
+func (i *invocation) Extra(key string) interface{} {
+	if i.extra == nil {
+		return nil
+	}
+	return i.extra[key]
 }
 
 // Reset implements the InvocationSetter interface.
@@ -147,4 +175,7 @@ func (i *invocation) zero() {
 	i.serviceName = ""
 	i.methodName = ""
 	i.bizErr = nil
+	for key := range i.extra {
+		delete(i.extra, key)
+	}
 }

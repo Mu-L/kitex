@@ -21,7 +21,6 @@ package transport
 type Protocol int
 
 // Predefined transport protocols.
-// Framed is suggested.
 const (
 	PurePayload Protocol = 0
 
@@ -29,8 +28,11 @@ const (
 	Framed
 	HTTP
 	GRPC
+	HESSIAN2
+	STREAMING
 
-	TTHeaderFramed = TTHeader | Framed
+	TTHeaderFramed    = TTHeader | Framed
+	TTHeaderStreaming = TTHeader | STREAMING
 )
 
 // Unknown indicates the protocol is unknown.
@@ -51,6 +53,10 @@ func (tp Protocol) String() string {
 		return "TTHeaderFramed"
 	case GRPC:
 		return "GRPC"
+	case HESSIAN2:
+		return "Hessian2"
+	case TTHeaderStreaming:
+		return "TTHeaderStreaming"
 	}
 	return Unknown
 }

@@ -20,7 +20,14 @@ import (
 	"net"
 	"sync"
 
+	"github.com/bytedance/gopkg/lang/mcache"
+
 	"github.com/cloudwego/kitex/pkg/remote"
+)
+
+const (
+	// min is 4k
+	minMallocSize = 4 * 1024
 )
 
 // GRPCConn implement WriteFrame and ReadFrame
@@ -45,11 +52,7 @@ var (
 
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		return &buffer{
-			rbuf: make([]byte, 0, 4096),
-			wbuf: nil,
-			whdr: nil,
-		}
+		return &buffer{}
 	},
 }
 
@@ -64,7 +67,13 @@ func (b *buffer) growRbuf(n int) {
 	if capacity >= n {
 		return
 	}
-	buf := make([]byte, 0, 2*capacity+n)
+	if n < minMallocSize {
+		n = minMallocSize
+	}
+	buf := mcache.Malloc(0, n)
+	if cap(b.rbuf) > 0 {
+		mcache.Free(b.rbuf)
+	}
 	b.rbuf = buf
 }
 
@@ -95,7 +104,11 @@ func (b *buffer) Flush() (err error) {
 }
 
 func (b *buffer) Release(e error) (err error) {
-	b.rbuf = b.rbuf[:0]
+	if cap(b.rbuf) > 0 {
+		mcache.Free(b.rbuf)
+	}
+	b.conn = nil
+	b.rbuf = nil
 	b.whdr = nil
 	b.wbuf = nil
 	bufferPool.Put(b)
@@ -132,7 +145,7 @@ func (b *buffer) ReadString(n int) (s string, err error) {
 	panic("implement me")
 }
 
-func (b *buffer) ReadBinary(n int) (p []byte, err error) {
+func (b *buffer) ReadBinary(p []byte) (n int, err error) {
 	panic("implement me")
 }
 
@@ -140,7 +153,7 @@ func (b *buffer) Malloc(n int) (buf []byte, err error) {
 	panic("implement me")
 }
 
-func (b *buffer) MallocLen() (length int) {
+func (b *buffer) WrittenLen() (length int) {
 	panic("implement me")
 }
 

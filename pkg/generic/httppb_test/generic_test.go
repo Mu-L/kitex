@@ -19,7 +19,7 @@ package test
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -47,7 +47,7 @@ func initThriftClientByIDL(t *testing.T, addr, idl, pbIdl string) genericclient.
 	test.Assert(t, err == nil)
 	pbf, err := os.Open(pbIdl)
 	test.Assert(t, err == nil)
-	pbContent, err := ioutil.ReadAll(pbf)
+	pbContent, err := io.ReadAll(pbf)
 	test.Assert(t, err == nil)
 	pbf.Close()
 	pbp, err := generic.NewPbContentProvider(pbIdl, map[string]string{pbIdl: string(pbContent)})
@@ -67,14 +67,14 @@ func initThriftServer(t *testing.T, address string, handler generic.Service) ser
 	test.Assert(t, err == nil)
 	svr := newGenericServer(g, addr, handler)
 	test.Assert(t, err == nil)
+	test.WaitServerStart(addr.String())
 	return svr
 }
 
 func testThriftNormalEcho(t *testing.T) {
-	svr := initThriftServer(t, ":8128", new(GenericServiceEchoImpl))
-	time.Sleep(500 * time.Millisecond)
-
-	cli := initThriftClientByIDL(t, "127.0.0.1:8128", "./idl/echo.thrift", "./idl/echo.proto")
+	addr := test.GetLocalAddress()
+	svr := initThriftServer(t, addr, new(GenericServiceEchoImpl))
+	cli := initThriftClientByIDL(t, addr, "./idl/echo.thrift", "./idl/echo.proto")
 	url := "http://example.com/Echo"
 
 	// []byte value for field

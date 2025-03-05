@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 
@@ -39,10 +40,18 @@ var (
 	addrMock = utils.NewNetAddr("mock", "127.0.0.1:8888")
 )
 
+func sameFuncPointer(f1, f2 interface{}) bool {
+	return reflect.ValueOf(f1).Pointer() == reflect.ValueOf(f2).Pointer()
+}
+
 func TestNewCBSuite(t *testing.T) {
 	cb := NewCBSuite(RPCInfo2Key)
 	test.Assert(t, cb.servicePanel == nil)
 	test.Assert(t, cb.instancePanel == nil)
+	test.Assert(t, cb.instanceCBConfig.CBConfig == GetDefaultCBConfig())
+	test.Assert(t, sameFuncPointer(cb.genServiceCBKey, RPCInfo2Key))
+	test.Assert(t, sameFuncPointer(cb.config.instanceGetErrorTypeFunc, ErrorTypeOnInstanceLevel))
+	test.Assert(t, sameFuncPointer(cb.config.serviceGetErrorTypeFunc, ErrorTypeOnServiceLevel))
 
 	var mws []endpoint.Middleware
 	mws = append(mws, cb.ServiceCBMW())
@@ -74,6 +83,36 @@ func TestGetServiceCB(t *testing.T) {
 	cb.ServiceControl()
 	test.Assert(t, cb.servicePanel != nil)
 	test.Assert(t, cb.serviceControl != nil)
+}
+
+func TestNewCBSuiteOptions(t *testing.T) {
+	t.Run("WithServiceGetErrorType", func(t *testing.T) {
+		// prepare
+		f := func(ctx context.Context, request, response interface{}, err error) ErrorType {
+			return TypeSuccess
+		}
+
+		// test
+		cb := NewCBSuite(RPCInfo2Key, WithServiceGetErrorType(f))
+
+		// check
+		ctl := cb.ServiceControl()
+		test.Assert(t, sameFuncPointer(ctl.GetErrorType, f))
+	})
+	t.Run("WithInstanceControl", func(t *testing.T) {
+		// prepare
+		f := func(ctx context.Context, request, response interface{}, err error) ErrorType {
+			return TypeSuccess
+		}
+
+		// test
+		cb := NewCBSuite(RPCInfo2Key, WithInstanceGetErrorType(f))
+		cb.initInstanceCB()
+
+		// check
+		ctl := cb.instanceControl
+		test.Assert(t, sameFuncPointer(ctl.GetErrorType, f))
+	})
 }
 
 func TestServiceCB(t *testing.T) {
@@ -429,4 +468,207 @@ func (m mockInst) Weight() int {
 
 func (m mockInst) Tag(key string) (value string, exist bool) {
 	return
+}
+
+func TestCBConfig_DeepCopy(t *testing.T) {
+	type fields struct {
+		c *CBConfig
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		want   *CBConfig
+	}{
+		{
+			name: "test_nil_copy",
+			fields: fields{
+				c: nil,
+			},
+			want: nil,
+		},
+		{
+			name: "test_all_copy",
+			fields: fields{
+				c: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.1,
+					MinSample: 10,
+				},
+			},
+			want: &CBConfig{
+				Enable:    true,
+				ErrRate:   0.1,
+				MinSample: 10,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.fields.c.DeepCopy(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("DeepCopy() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCBConfig_Equals(t *testing.T) {
+	type fields struct {
+		c *CBConfig
+	}
+	type args struct {
+		other *CBConfig
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   bool
+	}{
+		{
+			name: "test_nil_equal",
+			fields: fields{
+				c: nil,
+			},
+			args: args{
+				other: nil,
+			},
+			want: true,
+		},
+		{
+			name: "test_nil_not_equal",
+			fields: fields{
+				c: nil,
+			},
+			args: args{
+				other: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.1,
+					MinSample: 10,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "test_other_nil_not_equal",
+			fields: fields{
+				c: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.1,
+					MinSample: 10,
+				},
+			},
+			args: args{
+				other: nil,
+			},
+			want: false,
+		},
+		{
+			name: "test_all_equal",
+			fields: fields{
+				c: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.1,
+					MinSample: 10,
+				},
+			},
+			args: args{
+				other: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.1,
+					MinSample: 10,
+				},
+			},
+			want: true,
+		},
+		{
+			name: "test_all_not_equal",
+			fields: fields{
+				c: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.1,
+					MinSample: 10,
+				},
+			},
+			args: args{
+				other: &CBConfig{
+					Enable:    false,
+					ErrRate:   0.2,
+					MinSample: 20,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "test_enable_equal",
+			fields: fields{
+				c: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.1,
+					MinSample: 10,
+				},
+			},
+			args: args{
+				other: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.2,
+					MinSample: 20,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "test_err_rate_equal",
+			fields: fields{
+				c: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.1,
+					MinSample: 10,
+				},
+			},
+			args: args{
+				other: &CBConfig{
+					Enable:    false,
+					ErrRate:   0.1,
+					MinSample: 20,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "test_min_sample_equal",
+			fields: fields{
+				c: &CBConfig{
+					Enable:    true,
+					ErrRate:   0.1,
+					MinSample: 10,
+				},
+			},
+			args: args{
+				other: &CBConfig{
+					Enable:    false,
+					ErrRate:   0.2,
+					MinSample: 10,
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.fields.c.Equals(tt.args.other); got != tt.want {
+				t.Errorf("Equals() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func BenchmarkCBSuiteMW(b *testing.B) {
+	ctx := prepareCtx()
+	p := NewCBSuite(func(ri rpcinfo.RPCInfo) string { return "BenchmarkCBSuite" })
+	smw := p.ServiceCBMW()
+	noop := func(ctx context.Context, req, resp interface{}) (err error) { return nil }
+	ep := smw(noop)
+	for i := 0; i < b.N; i++ {
+		ep(ctx, b, b)
+	}
 }

@@ -21,7 +21,6 @@ import (
 	"errors"
 	"net"
 	"testing"
-	"time"
 
 	"github.com/cloudwego/netpoll"
 
@@ -33,26 +32,33 @@ import (
 // TestOnActive test server_handler OnActive success
 func TestOnActive(t *testing.T) {
 	// 1. prepare mock data
-	var readTimeout time.Duration
 	conn := &MockNetpollConn{
-		SetReadTimeoutFunc: func(timeout time.Duration) (e error) {
-			readTimeout = timeout
-			return nil
-		},
 		Conn: mocks.Conn{
 			RemoteAddrFunc: func() (r net.Addr) {
 				return addr
 			},
 		},
+		ReaderFunc: func() (r netpoll.Reader) {
+			reader := &MockNetpollReader{
+				ReleaseFunc: func() (err error) {
+					return nil
+				},
+			}
+			return reader
+		},
+		WriterFunc: func() (r netpoll.Writer) {
+			writer := &MockNetpollWriter{
+				FlushFunc: func() (err error) {
+					return nil
+				},
+			}
+			return writer
+		},
 	}
-
-	// 2. test
 	ctx := context.Background()
-	ctx, err := svrTransHdlr.OnActive(ctx, conn)
+	remote.NewTransPipeline(svrTransHdlr)
+	_, err := svrTransHdlr.OnActive(ctx, conn)
 	test.Assert(t, err == nil, err)
-	err = svrTransHdlr.OnRead(ctx, conn)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, readTimeout == rwTimeout, readTimeout, rwTimeout)
 }
 
 // TestOnRead test server_handler OnRead success
@@ -166,8 +172,8 @@ func TestInvokeErr(t *testing.T) {
 	test.Assert(t, isInvoked)
 }
 
-// TestPanicAfterRead test server_handler not panic after read
-func TestPanicAfterRead(t *testing.T) {
+// TestPipelineNilPanic test server_handler that TransPipeline is nil
+func TestPipelineNilPanic(t *testing.T) {
 	// 1. prepare mock data
 	var isWriteBufFlushed bool
 	var isReaderBufReleased bool
@@ -214,11 +220,11 @@ func TestPanicAfterRead(t *testing.T) {
 	test.Assert(t, err == nil, err)
 
 	err = svrTransHdlr.OnRead(ctx, conn)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, isReaderBufReleased)
+	test.Assert(t, err != nil, err)
+	test.Assert(t, !isReaderBufReleased)
 	test.Assert(t, !isWriteBufFlushed)
 	test.Assert(t, !isInvoked)
-	test.Assert(t, isClosed)
+	test.Assert(t, !isClosed)
 }
 
 // TestNoMethodInfo test server_handler without method info success
@@ -260,7 +266,8 @@ func TestNoMethodInfo(t *testing.T) {
 		},
 	}
 	remote.NewTransPipeline(svrTransHdlr)
-	delete(svrOpt.SvcInfo.Methods, method)
+	svcInfo := svrOpt.TargetSvcInfo
+	delete(svcInfo.Methods, method)
 
 	// 2. test
 	ctx := context.Background()
@@ -268,8 +275,8 @@ func TestNoMethodInfo(t *testing.T) {
 	test.Assert(t, err == nil, err)
 
 	err = svrTransHdlr.OnRead(ctx, conn)
-	test.Assert(t, err == nil, err)
+	test.Assert(t, err != nil, err)
 	test.Assert(t, isReaderBufReleased)
 	test.Assert(t, isWriteBufFlushed)
-	test.Assert(t, isClosed)
+	test.Assert(t, !isClosed)
 }

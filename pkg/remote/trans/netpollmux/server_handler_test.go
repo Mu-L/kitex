@@ -28,7 +28,7 @@ import (
 	"github.com/cloudwego/netpoll"
 
 	"github.com/cloudwego/kitex/internal/mocks"
-	"github.com/cloudwego/kitex/internal/stats"
+	mocksremote "github.com/cloudwego/kitex/internal/mocks/remote"
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/codec"
@@ -43,6 +43,9 @@ var (
 	addrStr   = "test addr"
 	addr      = utils.NewNetAddr("tcp", addrStr)
 	method    = "mock"
+
+	svcInfo     = mocks.ServiceInfo()
+	svcSearcher = mocksremote.NewDefaultSvcSearcher()
 )
 
 func newTestRpcInfo() rpcinfo.RPCInfo {
@@ -76,11 +79,13 @@ func init() {
 			DecodeFunc: func(ctx context.Context, msg remote.Message, in remote.ByteBuffer) error {
 				in.Skip(3 * codec.Size32)
 				_, err := in.ReadString(len(body))
+				msg.SpecifyServiceInfo(mocks.MockServiceName, mocks.MockMethod)
 				return err
 			},
 		},
-		SvcInfo:          mocks.ServiceInfo(),
-		TracerCtl:        &stats.Controller{},
+		SvcSearcher:      svcSearcher,
+		TargetSvcInfo:    svcInfo,
+		TracerCtl:        &rpcinfo.TraceController{},
 		ReadWriteTimeout: rwTimeout,
 	}
 }
@@ -144,6 +149,13 @@ func TestMuxSvrWrite(t *testing.T) {
 	msg := &MockMessage{
 		RPCInfoFunc: func() rpcinfo.RPCInfo {
 			return rpcInfo
+		},
+		ServiceInfoFunc: func() *serviceinfo.ServiceInfo {
+			return &serviceinfo.ServiceInfo{
+				Methods: map[string]serviceinfo.MethodInfo{
+					"method": serviceinfo.NewMethodInfo(nil, nil, nil, false),
+				},
+			}
 		},
 	}
 
@@ -464,11 +476,13 @@ func TestInvokeError(t *testing.T) {
 			DecodeFunc: func(ctx context.Context, msg remote.Message, in remote.ByteBuffer) error {
 				in.Skip(3 * codec.Size32)
 				_, err := in.ReadString(len(body))
+				msg.SpecifyServiceInfo(mocks.MockServiceName, mocks.MockMethod)
 				return err
 			},
 		},
-		SvcInfo:          mocks.ServiceInfo(),
-		TracerCtl:        &stats.Controller{},
+		SvcSearcher:      svcSearcher,
+		TargetSvcInfo:    svcInfo,
+		TracerCtl:        &rpcinfo.TraceController{},
 		ReadWriteTimeout: rwTimeout,
 	}
 
@@ -625,7 +639,8 @@ func TestInvokeNoMethod(t *testing.T) {
 	pl := remote.NewTransPipeline(svrTransHdlr)
 	svrTransHdlr.SetPipeline(pl)
 
-	delete(opt.SvcInfo.Methods, method)
+	svcInfo = opt.TargetSvcInfo
+	delete(svcInfo.Methods, method)
 
 	if setter, ok := svrTransHdlr.(remote.InvokeHandleFuncSetter); ok {
 		setter.SetInvokeHandleFunc(func(ctx context.Context, req, resp interface{}) (err error) {
@@ -640,4 +655,124 @@ func TestInvokeNoMethod(t *testing.T) {
 	test.Assert(t, isReaderBufReleased)
 	test.Assert(t, isWriteBufFlushed.Load() == 1)
 	test.Assert(t, !isInvoked)
+}
+
+// TestMuxSvcOnReadHeartbeat test SvrTransHandler OnRead to process heartbeat
+func TestMuxSvrOnReadHeartbeat(t *testing.T) {
+	var isWriteBufFlushed atomic.Value
+	var isReaderBufReleased atomic.Value
+	var isInvoked atomic.Value
+
+	buf := netpoll.NewLinkBuffer(1024)
+	npconn := &MockNetpollConn{
+		ReaderFunc: func() (r netpoll.Reader) {
+			isReaderBufReleased.Store(1)
+			return buf
+		},
+		WriterFunc: func() (r netpoll.Writer) {
+			isWriteBufFlushed.Store(1)
+			return buf
+		},
+		Conn: mocks.Conn{
+			RemoteAddrFunc: func() (r net.Addr) {
+				return addr
+			},
+		},
+	}
+
+	var heartbeatFlag bool
+	body := "non-heartbeat process"
+	ctx := context.Background()
+	rpcInfo := newTestRpcInfo()
+	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, rpcInfo)
+
+	// use newOpt cause we need to add heartbeat logic to EncodeFunc and DecodeFunc
+	newOpt := &remote.ServerOption{
+		InitOrResetRPCInfoFunc: func(ri rpcinfo.RPCInfo, addr net.Addr) rpcinfo.RPCInfo {
+			return rpcInfo
+		},
+		Codec: &MockCodec{
+			EncodeFunc: func(ctx context.Context, msg remote.Message, out remote.ByteBuffer) error {
+				if heartbeatFlag {
+					if msg.MessageType() != remote.Heartbeat {
+						return errors.New("response is not of MessageType Heartbeat")
+					}
+					return nil
+				}
+				r := mockHeader(msg.RPCInfo().Invocation().SeqID(), body)
+				_, err := out.WriteBinary(r.Bytes())
+				return err
+			},
+			DecodeFunc: func(ctx context.Context, msg remote.Message, in remote.ByteBuffer) error {
+				if heartbeatFlag {
+					msg.SetMessageType(remote.Heartbeat)
+					return nil
+				}
+				in.Skip(3 * codec.Size32)
+				_, err := in.ReadString(len(body))
+				return err
+			},
+		},
+		SvcSearcher:      svcSearcher,
+		TargetSvcInfo:    svcInfo,
+		TracerCtl:        &rpcinfo.TraceController{},
+		ReadWriteTimeout: rwTimeout,
+	}
+	svrTransHdlr, _ := NewSvrTransHandlerFactory().NewTransHandler(newOpt)
+
+	msg := &MockMessage{
+		RPCInfoFunc: func() rpcinfo.RPCInfo {
+			return rpcInfo
+		},
+		ServiceInfoFunc: func() *serviceinfo.ServiceInfo {
+			return &serviceinfo.ServiceInfo{
+				Methods: map[string]serviceinfo.MethodInfo{
+					"method": serviceinfo.NewMethodInfo(nil, nil, nil, false),
+				},
+			}
+		},
+	}
+
+	pool := &sync.Pool{}
+	muxSvrCon := newMuxSvrConn(npconn, pool)
+
+	var err error
+
+	ri := rpcinfo.GetRPCInfo(ctx)
+	test.Assert(t, ri != nil, ri)
+
+	ctx, err = svrTransHdlr.Write(ctx, muxSvrCon, msg)
+	test.Assert(t, ctx != nil, ctx)
+	test.Assert(t, err == nil, err)
+
+	time.Sleep(10 * time.Millisecond)
+	buf.Flush()
+	test.Assert(t, npconn.Reader().Len() > 0, npconn.Reader().Len())
+
+	ctx, err = svrTransHdlr.OnActive(ctx, muxSvrCon)
+	test.Assert(t, ctx != nil, ctx)
+	test.Assert(t, err == nil, err)
+	muxSvrConFromCtx, _ := ctx.Value(ctxKeyMuxSvrConn{}).(*muxSvrConn)
+	test.Assert(t, muxSvrConFromCtx != nil)
+
+	pl := remote.NewTransPipeline(svrTransHdlr)
+	svrTransHdlr.SetPipeline(pl)
+
+	if setter, ok := svrTransHdlr.(remote.InvokeHandleFuncSetter); ok {
+		setter.SetInvokeHandleFunc(func(ctx context.Context, req, resp interface{}) (err error) {
+			isInvoked.Store(1)
+			return nil
+		})
+	}
+
+	// start the heartbeat processing
+	heartbeatFlag = true
+	err = svrTransHdlr.OnRead(ctx, npconn)
+	test.Assert(t, err == nil, err)
+	time.Sleep(50 * time.Millisecond)
+
+	test.Assert(t, isReaderBufReleased.Load() == 1)
+	test.Assert(t, isWriteBufFlushed.Load() == 1)
+	// InvokeHandleFunc has not been invoked
+	test.Assert(t, isInvoked.Load() == nil)
 }

@@ -18,12 +18,8 @@ package generic
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/apache/thrift/lib/go/thrift"
-
-	gthrift "github.com/cloudwego/kitex/pkg/generic/thrift"
-	codecThrift "github.com/cloudwego/kitex/pkg/remote/codec/thrift"
+	"github.com/cloudwego/kitex/internal/generic"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
@@ -33,26 +29,98 @@ type Service interface {
 	GenericCall(ctx context.Context, method string, request interface{}) (response interface{}, err error)
 }
 
-// ServiceInfo create a generic ServiceInfo
-func ServiceInfo(pcType serviceinfo.PayloadCodec) *serviceinfo.ServiceInfo {
-	return newServiceInfo(pcType)
+// ServiceInfoWithGeneric create a generic ServiceInfo
+func ServiceInfoWithGeneric(g Generic) *serviceinfo.ServiceInfo {
+	isCombinedServices := getIsCombinedServices(g)
+	return newServiceInfo(g, isCombinedServices)
 }
 
-func newServiceInfo(pcType serviceinfo.PayloadCodec) *serviceinfo.ServiceInfo {
-	serviceName := serviceinfo.GenericService
-	handlerType := (*Service)(nil)
-	methods := map[string]serviceinfo.MethodInfo{
-		serviceinfo.GenericMethod: serviceinfo.NewMethodInfo(callHandler, newGenericServiceCallArgs, newGenericServiceCallResult, false),
+func getIsCombinedServices(g Generic) bool {
+	if extra, ok := g.(ExtraProvider); ok {
+		if extra.GetExtra(CombineServiceKey) == "true" {
+			return true
+		}
 	}
+	return false
+}
+
+func newServiceInfo(g Generic, isCombinedServices bool) *serviceinfo.ServiceInfo {
+	handlerType := (*Service)(nil)
+
+	methods, svcName := getMethodInfo(g, g.IDLServiceName())
+
 	svcInfo := &serviceinfo.ServiceInfo{
-		ServiceName:  serviceName,
+		ServiceName:  svcName,
 		HandlerType:  handlerType,
 		Methods:      methods,
-		PayloadCodec: pcType,
+		PayloadCodec: g.PayloadCodecType(),
 		Extra:        make(map[string]interface{}),
 	}
 	svcInfo.Extra["generic"] = true
+	if isCombinedServices {
+		svcInfo.Extra["combine_service"] = true
+	}
 	return svcInfo
+}
+
+func getMethodInfo(g Generic, serviceName string) (methods map[string]serviceinfo.MethodInfo, svcName string) {
+	if g.PayloadCodec() != nil {
+		// note: binary generic cannot be used with multi-service feature
+		svcName = serviceinfo.GenericService
+		methods = map[string]serviceinfo.MethodInfo{
+			serviceinfo.GenericMethod: serviceinfo.NewMethodInfo(callHandler, newGenericServiceCallArgs, newGenericServiceCallResult, false),
+		}
+	} else {
+		svcName = serviceName
+		methods = map[string]serviceinfo.MethodInfo{
+			serviceinfo.GenericMethod: serviceinfo.NewMethodInfo(
+				callHandler,
+				func() interface{} {
+					args := &Args{}
+					args.SetCodec(g.MessageReaderWriter())
+					return args
+				},
+				func() interface{} {
+					result := &Result{}
+					result.SetCodec(g.MessageReaderWriter())
+					return result
+				},
+				false,
+			),
+		}
+	}
+	return
+}
+
+// GetMethodInfo is only used in kitex, please DON'T USE IT.
+// DEPRECATED: this method is no longer used. This method will be removed in the future
+func GetMethodInfo(messageReaderWriter interface{}, serviceName string) (methods map[string]serviceinfo.MethodInfo, svcName string) {
+	if messageReaderWriter == nil {
+		// note: binary generic cannot be used with multi-service feature
+		svcName = serviceinfo.GenericService
+		methods = map[string]serviceinfo.MethodInfo{
+			serviceinfo.GenericMethod: serviceinfo.NewMethodInfo(callHandler, newGenericServiceCallArgs, newGenericServiceCallResult, false),
+		}
+	} else {
+		svcName = serviceName
+		methods = map[string]serviceinfo.MethodInfo{
+			serviceinfo.GenericMethod: serviceinfo.NewMethodInfo(
+				callHandler,
+				func() interface{} {
+					args := &Args{}
+					args.SetCodec(messageReaderWriter)
+					return args
+				},
+				func() interface{} {
+					result := &Result{}
+					result.SetCodec(messageReaderWriter)
+					return result
+				},
+				false,
+			),
+		}
+	}
+	return
 }
 
 func callHandler(ctx context.Context, handler, arg, result interface{}) error {
@@ -80,99 +148,12 @@ type WithCodec interface {
 }
 
 // Args generic request
-type Args struct {
-	Request interface{}
-	Method  string
-	base    *gthrift.Base
-	inner   interface{}
-}
-
-var (
-	_ codecThrift.MessageReaderWithMethodWithContext = (*Args)(nil)
-	_ codecThrift.MessageWriterWithContext           = (*Args)(nil)
-	_ WithCodec                                      = (*Args)(nil)
-)
-
-// SetCodec ...
-func (g *Args) SetCodec(inner interface{}) {
-	g.inner = inner
-}
-
-func (g *Args) GetOrSetBase() interface{} {
-	if g.base == nil {
-		g.base = gthrift.NewBase()
-	}
-	return g.base
-}
-
-// Write ...
-func (g *Args) Write(ctx context.Context, out thrift.TProtocol) error {
-	if w, ok := g.inner.(gthrift.MessageWriter); ok {
-		return w.Write(ctx, out, g.Request, g.base)
-	}
-	return fmt.Errorf("unexpected Args writer type: %T", g.inner)
-}
-
-// Read ...
-func (g *Args) Read(ctx context.Context, method string, in thrift.TProtocol) error {
-	if w, ok := g.inner.(gthrift.MessageReader); ok {
-		g.Method = method
-		var err error
-		g.Request, err = w.Read(ctx, method, in)
-		return err
-	}
-	return fmt.Errorf("unexpected Args reader type: %T", g.inner)
-}
+type Args = generic.Args
 
 // Result generic response
-type Result struct {
-	Success interface{}
-	inner   interface{}
-}
+type Result = generic.Result
 
 var (
-	_ codecThrift.MessageReaderWithMethodWithContext = (*Result)(nil)
-	_ codecThrift.MessageWriterWithContext           = (*Result)(nil)
-	_ WithCodec                                      = (*Result)(nil)
+	_ WithCodec = (*Args)(nil)
+	_ WithCodec = (*Result)(nil)
 )
-
-// SetCodec ...
-func (r *Result) SetCodec(inner interface{}) {
-	r.inner = inner
-}
-
-// Write ...
-func (r *Result) Write(ctx context.Context, out thrift.TProtocol) error {
-	if w, ok := r.inner.(gthrift.MessageWriter); ok {
-		return w.Write(ctx, out, r.Success, nil)
-	}
-	return fmt.Errorf("unexpected Result writer type: %T", r.inner)
-}
-
-// Read ...
-func (r *Result) Read(ctx context.Context, method string, in thrift.TProtocol) error {
-	if w, ok := r.inner.(gthrift.MessageReader); ok {
-		var err error
-		r.Success, err = w.Read(ctx, method, in)
-		return err
-	}
-	return fmt.Errorf("unexpected Result reader type: %T", r.inner)
-}
-
-// GetSuccess ...
-func (r *Result) GetSuccess() interface{} {
-	if !r.IsSetSuccess() {
-		return nil
-	}
-	return r.Success
-}
-
-// SetSuccess ...
-func (r *Result) SetSuccess(x interface{}) {
-	r.Success = x
-}
-
-// IsSetSuccess ...
-func (r *Result) IsSetSuccess() bool {
-	return r.Success != nil
-}

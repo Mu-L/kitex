@@ -62,4 +62,95 @@ func TestRPCStats(t *testing.T) {
 	test.Assert(t, st.Error() == nil)
 	ok, err = st.Panicked()
 	test.Assert(t, !ok && err == nil)
+
+	t.Run("IncrSendSize", func(t *testing.T) {
+		st := rpcinfo.NewRPCStats()
+
+		rpcinfo.AsMutableRPCStats(st).IncrSendSize(10)
+		test.Assert(t, st.SendSize() == 10, st.SendSize())
+		test.Assert(t, st.LastSendSize() == 10, st.LastSendSize())
+
+		rpcinfo.AsMutableRPCStats(st).IncrSendSize(15)
+		test.Assert(t, st.SendSize() == 25, st.SendSize())
+		test.Assert(t, st.LastSendSize() == 15, st.LastSendSize())
+	})
+
+	t.Run("IncrRecvSize", func(t *testing.T) {
+		st := rpcinfo.NewRPCStats()
+
+		rpcinfo.AsMutableRPCStats(st).IncrRecvSize(10)
+		test.Assert(t, st.RecvSize() == 10, st.RecvSize())
+		test.Assert(t, st.LastRecvSize() == 10, st.LastRecvSize())
+
+		rpcinfo.AsMutableRPCStats(st).IncrRecvSize(15)
+		test.Assert(t, st.RecvSize() == 25, st.RecvSize())
+		test.Assert(t, st.LastRecvSize() == 15, st.LastRecvSize())
+	})
+}
+
+func TestRPCStats_Record(t *testing.T) {
+	ctx := context.Background()
+	s := rpcinfo.NewRPCStats()
+	rpcinfo.AsMutableRPCStats(s).SetLevel(stats.LevelDetailed)
+	test.Assert(t, s.GetEvent(stats.RPCStart) == nil)
+	s.Record(ctx, stats.RPCStart, stats.StatusInfo, "hello")
+	test.Assert(t, s.GetEvent(stats.RPCStart).Info() == "hello")
+
+	// will not change, the event already recorded
+	s.Record(ctx, stats.RPCStart, stats.StatusInfo, "world")
+	test.Assert(t, s.GetEvent(stats.RPCStart).Info() == "hello")
+
+	s = s.CopyForRetry()
+	test.Assert(t, s.GetEvent(stats.RPCStart).Info() == "hello")
+
+	// it's from CopyForRetry, it can be changed once.
+	s.Record(ctx, stats.RPCStart, stats.StatusInfo, "world")
+	test.Assert(t, s.GetEvent(stats.RPCStart).Info() == "world")
+	s.Record(ctx, stats.RPCStart, stats.StatusInfo, "hello")
+	test.Assert(t, s.GetEvent(stats.RPCStart).Info() == "world")
+}
+
+func BenchmarkCopyForRetry(b *testing.B) {
+	b.Run("BenchmarkNewRPCStats", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			_ = rpcinfo.NewRPCStats()
+		}
+	})
+
+	s := rpcinfo.NewRPCStats()
+	b.Run("BenchmarkCopyForRetry", func(b *testing.B) {
+		s.Record(context.Background(), stats.RPCStart, stats.StatusInfo, "")
+		for i := 0; i < b.N; i++ {
+			_ = s.CopyForRetry()
+		}
+	})
+}
+
+func TestNewEvent(t *testing.T) {
+	evt := rpcinfo.NewEvent(stats.RPCStart, stats.StatusError, "err")
+	test.Assert(t, evt.Event() == stats.RPCStart)
+	test.Assert(t, evt.Status() == stats.StatusError)
+	test.Assert(t, evt.Info() == "err")
+	test.Assert(t, !evt.Time().IsZero())
+	test.Assert(t, !evt.IsNil())
+}
+
+func Test_rpcStats_LastSendSize(t *testing.T) {
+	stat := rpcinfo.NewRPCStats()
+	rpcinfo.AsMutableRPCStats(stat).IncrSendSize(10)
+	test.Assert(t, stat.LastSendSize() == 10)
+	test.Assert(t, stat.SendSize() == 10)
+	rpcinfo.AsMutableRPCStats(stat).IncrSendSize(10)
+	test.Assert(t, stat.LastSendSize() == 10)
+	test.Assert(t, stat.SendSize() == 20)
+}
+
+func Test_rpcStats_LastRecvSize(t *testing.T) {
+	stat := rpcinfo.NewRPCStats()
+	rpcinfo.AsMutableRPCStats(stat).IncrRecvSize(10)
+	test.Assert(t, stat.LastRecvSize() == 10)
+	test.Assert(t, stat.RecvSize() == 10)
+	rpcinfo.AsMutableRPCStats(stat).IncrRecvSize(10)
+	test.Assert(t, stat.LastRecvSize() == 10)
+	test.Assert(t, stat.RecvSize() == 20)
 }

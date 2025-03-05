@@ -27,12 +27,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudwego/localsession/backup"
+
 	internal_server "github.com/cloudwego/kitex/internal/server"
-	internal_stats "github.com/cloudwego/kitex/internal/stats"
 	"github.com/cloudwego/kitex/pkg/acl"
 	"github.com/cloudwego/kitex/pkg/diagnosis"
 	"github.com/cloudwego/kitex/pkg/discovery"
 	"github.com/cloudwego/kitex/pkg/endpoint"
+	"github.com/cloudwego/kitex/pkg/gofunc"
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/limiter"
@@ -45,25 +47,26 @@ import (
 	"github.com/cloudwego/kitex/pkg/stats"
 )
 
-// Server is a abstraction of a RPC server. It accepts connections and dispatches them to the service
+// Server is an abstraction of an RPC server. It accepts connections and dispatches them to the service
 // registered to it.
 type Server interface {
-	RegisterService(svcInfo *serviceinfo.ServiceInfo, handler interface{}) error
-	GetServiceInfo() *serviceinfo.ServiceInfo
+	RegisterService(svcInfo *serviceinfo.ServiceInfo, handler interface{}, opts ...RegisterOption) error
+	GetServiceInfos() map[string]*serviceinfo.ServiceInfo
 	Run() error
 	Stop() error
 }
 
 type server struct {
-	opt     *internal_server.Options
-	svcInfo *serviceinfo.ServiceInfo
+	opt           *internal_server.Options
+	svcs          *services
+	targetSvcInfo *serviceinfo.ServiceInfo
 
 	// actual rpc service implement of biz
-	handler interface{}
 	eps     endpoint.Endpoint
-	mws     []endpoint.Middleware
 	svr     remotesvr.Server
 	stopped sync.Once
+	isInit  bool
+	isRun   bool
 
 	sync.Mutex
 }
@@ -71,26 +74,29 @@ type server struct {
 // NewServer creates a server with the given Options.
 func NewServer(ops ...Option) Server {
 	s := &server{
-		opt: internal_server.NewOptions(ops),
+		opt:  internal_server.NewOptions(ops),
+		svcs: newServices(),
 	}
-	s.init()
 	return s
 }
 
 func (s *server) init() {
-	ctx := fillContext(s.opt)
-	s.mws = richMWsWithBuilder(ctx, s.opt.MWBs, s)
-	s.mws = append(s.mws, acl.NewACLMiddleware(s.opt.ACLRules))
-	if s.opt.ErrHandle != nil {
-		// errorHandleMW must be the last middleware,
-		// to ensure it only catches the server handler's error.
-		s.mws = append(s.mws, newErrorHandleMW(s.opt.ErrHandle))
+	if s.isInit {
+		return
 	}
+	s.isInit = true
+	ctx := fillContext(s.opt)
 	if ds := s.opt.DebugService; ds != nil {
 		ds.RegisterProbeFunc(diagnosis.OptionsKey, diagnosis.WrapAsProbeFunc(s.opt.DebugInfo))
 		ds.RegisterProbeFunc(diagnosis.ChangeEventsKey, s.opt.Events.Dump)
 	}
-	s.buildInvokeChain()
+	backup.Init(s.opt.BackupOpt)
+
+	// init invoker chain here since we need to get some svc information to add MW
+	// register stream recv/send middlewares
+	s.buildInvokeChain(ctx)
+	s.initStreamMiddlewares(ctx)
+	s.buildStreamInvokeChain()
 }
 
 func fillContext(opt *internal_server.Options) context.Context {
@@ -100,30 +106,10 @@ func fillContext(opt *internal_server.Options) context.Context {
 	return ctx
 }
 
-func richMWsWithBuilder(ctx context.Context, mwBs []endpoint.MiddlewareBuilder, ks *server) []endpoint.Middleware {
-	for i := range mwBs {
-		ks.mws = append(ks.mws, mwBs[i](ctx))
-	}
-	return ks.mws
-}
-
-// newErrorHandleMW provides a hook point for server error handling.
-func newErrorHandleMW(errHandle func(error) error) endpoint.Middleware {
-	return func(next endpoint.Endpoint) endpoint.Endpoint {
-		return func(ctx context.Context, request, response interface{}) error {
-			err := next(ctx, request, response)
-			if err == nil {
-				return nil
-			}
-			return errHandle(err)
-		}
-	}
-}
-
 func (s *server) initOrResetRPCInfoFunc() func(rpcinfo.RPCInfo, net.Addr) rpcinfo.RPCInfo {
 	return func(ri rpcinfo.RPCInfo, rAddr net.Addr) rpcinfo.RPCInfo {
-		// Reset rpcinfo if it exists in ctx.
-		if ri != nil {
+		// Reset existing rpcinfo to improve performance for long connections (PR #584).
+		if ri != nil && rpcinfo.PoolEnabled() {
 			fi := rpcinfo.AsMutableEndpointInfo(ri.From())
 			fi.Reset()
 			fi.SetAddress(rAddr)
@@ -139,6 +125,8 @@ func (s *server) initOrResetRPCInfoFunc() func(rpcinfo.RPCInfo, net.Addr) rpcinf
 			}
 			return ri
 		}
+
+		// allocate a new rpcinfo if it's the connection's first request or rpcInfoPool is disabled
 		rpcStats := rpcinfo.AsMutableRPCStats(rpcinfo.NewRPCStats())
 		if s.opt.StatsLevel != nil {
 			rpcStats.SetLevel(*s.opt.StatsLevel)
@@ -157,33 +145,97 @@ func (s *server) initOrResetRPCInfoFunc() func(rpcinfo.RPCInfo, net.Addr) rpcinf
 	}
 }
 
-func (s *server) buildInvokeChain() {
-	innerHandlerEp := s.invokeHandleEndpoint()
-	s.eps = endpoint.Chain(s.mws...)(innerHandlerEp)
+func (s *server) buildMiddlewares(ctx context.Context) []endpoint.Middleware {
+	var mws []endpoint.Middleware
+	// register server timeout middleware
+	// prepend for adding timeout to the context for all middlewares and the handler
+	if s.opt.EnableContextTimeout {
+		mws = append(mws, serverTimeoutMW)
+	}
+	// register server middlewares
+	for i := range s.opt.MWBs {
+		if mw := s.opt.MWBs[i](ctx); mw != nil {
+			mws = append(mws, mw)
+		}
+	}
+	// register services middlewares
+	if mw := s.buildServiceMiddleware(); mw != nil {
+		mws = append(mws, mw)
+	}
+	// register stream context inject middleware
+	// TODO(DMwangnima): this is a workaround to fix ctx diverge problem temporarily,
+	// it should be removed after the new streaming api with ctx published.
+	// if there is streaming method, make sure the ctxInjectMW is the last middleware before core middleware
+	if mw := s.buildStreamCtxInjectMiddleware(); mw != nil {
+		mws = append(mws, mw)
+	}
+	// register core middleware,
+	// core middleware MUST be the last middleware
+	mws = append(mws, s.buildCoreMiddleware())
+	return mws
 }
 
-// RegisterService should not be called by users directly.
-func (s *server) RegisterService(svcInfo *serviceinfo.ServiceInfo, handler interface{}) error {
-	if s.svcInfo != nil {
-		panic(fmt.Sprintf("Service[%s] is already defined", s.svcInfo.ServiceName))
+func (s *server) buildInvokeChain(ctx context.Context) {
+	mws := s.buildMiddlewares(ctx)
+	innerHandlerEp := s.invokeHandleEndpoint()
+	s.eps = endpoint.Chain(mws...)(innerHandlerEp)
+}
+
+// buildStreamCtxInjectMiddleware is a workaround to resolve stream ctx diverge problem in server side
+// when there is streaming method, add the ctxInjectMW to wrap the Stream
+func (s *server) buildStreamCtxInjectMiddleware() endpoint.Middleware {
+	for _, svc := range s.svcs.svcMap {
+		for _, method := range svc.svcInfo.Methods {
+			if method.IsStreaming() {
+				return newCtxInjectMW()
+			}
+		}
 	}
-	s.svcInfo = svcInfo
-	s.handler = handler
-	diagnosis.RegisterProbeFunc(s.opt.DebugService, diagnosis.ServiceInfoKey, diagnosis.WrapAsProbeFunc(s.svcInfo))
 	return nil
 }
 
-func (s *server) GetServiceInfo() *serviceinfo.ServiceInfo {
-	return s.svcInfo
+// RegisterService should not be called by users directly.
+func (s *server) RegisterService(svcInfo *serviceinfo.ServiceInfo, handler interface{}, opts ...RegisterOption) error {
+	s.Lock()
+	defer s.Unlock()
+	if s.isRun {
+		panic("service cannot be registered while server is running")
+	}
+	if svcInfo == nil {
+		panic("svcInfo is nil. please specify non-nil svcInfo")
+	}
+	if handler == nil || reflect.ValueOf(handler).IsNil() {
+		panic("handler is nil. please specify non-nil handler")
+	}
+	if s.svcs.svcMap[svcInfo.ServiceName] != nil {
+		panic(fmt.Sprintf("Service[%s] is already defined", svcInfo.ServiceName))
+	}
+
+	registerOpts := internal_server.NewRegisterOptions(opts)
+	// register service
+	if err := s.svcs.addService(svcInfo, handler, registerOpts); err != nil {
+		panic(err.Error())
+	}
+	return nil
+}
+
+func (s *server) GetServiceInfos() map[string]*serviceinfo.ServiceInfo {
+	return s.svcs.getSvcInfoMap()
 }
 
 // Run runs the server.
 func (s *server) Run() (err error) {
-	if s.svcInfo == nil {
-		return errors.New("no service, use RegisterService to set one")
-	}
+	s.Lock()
+	s.isRun = true
+	s.Unlock()
+	s.init()
 	if err = s.check(); err != nil {
 		return err
+	}
+	s.findAndSetDefaultService()
+	diagnosis.RegisterProbeFunc(s.opt.DebugService, diagnosis.ServiceInfosKey, diagnosis.WrapAsProbeFunc(s.svcs.getSvcInfoMap()))
+	if s.svcs.fallbackSvc != nil {
+		diagnosis.RegisterProbeFunc(s.opt.DebugService, diagnosis.FallbackServiceKey, diagnosis.WrapAsProbeFunc(s.svcs.fallbackSvc.svcInfo.ServiceName))
 	}
 	svrCfg := s.opt.RemoteOpt
 	addr := svrCfg.Address // should not be nil
@@ -194,31 +246,32 @@ func (s *server) Run() (err error) {
 		}
 	}
 
-	s.richRemoteOption()
 	s.fillMoreServiceInfo(s.opt.RemoteOpt.Address)
+	s.richRemoteOption()
 	transHdlr, err := s.newSvrTransHandler()
 	if err != nil {
 		return err
 	}
-	s.Lock()
-	s.svr, err = remotesvr.NewServer(s.opt.RemoteOpt, s.eps, transHdlr)
-	s.Unlock()
+	svr, err := remotesvr.NewServer(s.opt.RemoteOpt, transHdlr)
 	if err != nil {
 		return err
 	}
+	s.Lock()
+	s.svr = svr
+	s.Unlock()
 
 	// start profiler
 	if s.opt.RemoteOpt.Profiler != nil {
-		go func() {
+		gofunc.GoFunc(context.Background(), func() {
 			klog.Info("KITEX: server starting profiler")
 			err := s.opt.RemoteOpt.Profiler.Run(context.Background())
 			if err != nil {
 				klog.Errorf("KITEX: server started profiler error: error=%s", err.Error())
 			}
-		}()
+		})
 	}
 
-	errCh := s.svr.Start()
+	errCh := svr.Start()
 	select {
 	case err = <-errCh:
 		klog.Errorf("KITEX: server start error: error=%s", err.Error())
@@ -231,7 +284,7 @@ func (s *server) Run() (err error) {
 	}
 	muStartHooks.Unlock()
 	s.Lock()
-	s.buildRegistryInfo(s.svr.Address())
+	s.buildRegistryInfo(svr.Address())
 	s.Unlock()
 
 	if err = s.waitExit(errCh); err != nil {
@@ -270,24 +323,89 @@ func (s *server) Stop() (err error) {
 	return
 }
 
+func (s *server) buildServiceMiddleware() endpoint.Middleware {
+	hasServiceMW := false
+	for _, svc := range s.svcs.svcMap {
+		if svc.MW != nil {
+			hasServiceMW = true
+			break
+		}
+	}
+	if !hasServiceMW {
+		return nil
+	}
+	return func(next endpoint.Endpoint) endpoint.Endpoint {
+		return func(ctx context.Context, req, resp interface{}) (err error) {
+			ri := rpcinfo.GetRPCInfo(ctx)
+			serviceName := ri.Invocation().ServiceName()
+			svc := s.svcs.svcMap[serviceName]
+			if svc != nil && svc.MW != nil {
+				next = svc.MW(next)
+			}
+			return next(ctx, req, resp)
+		}
+	}
+}
+
+// buildCoreMiddleware build the core middleware that include some default framework logic like error handler and ACL.
+// the `next` function for core middleware should be the service handler itself without any wrapped middleware.
+func (s *server) buildCoreMiddleware() endpoint.Middleware {
+	return func(next endpoint.Endpoint) endpoint.Endpoint {
+		serviceHandler := next
+		return func(ctx context.Context, req, resp interface{}) (err error) {
+			// --- Before Next ---
+			if len(s.opt.ACLRules) > 0 {
+				if err = acl.ApplyRules(ctx, req, s.opt.ACLRules); err != nil {
+					return err
+				}
+			}
+
+			// --- Run Next ---
+			// run service handler
+			err = serviceHandler(ctx, req, resp)
+
+			// --- After Next ---
+			// error handler only catches the server handler's error.
+			if s.opt.ErrHandle != nil && err != nil {
+				err = s.opt.ErrHandle(ctx, err)
+			}
+
+			return err
+		}
+	}
+}
+
 func (s *server) invokeHandleEndpoint() endpoint.Endpoint {
 	return func(ctx context.Context, args, resp interface{}) (err error) {
 		ri := rpcinfo.GetRPCInfo(ctx)
 		methodName := ri.Invocation().MethodName()
-		if methodName == "" && s.svcInfo.ServiceName != serviceinfo.GenericService {
+		serviceName := ri.Invocation().ServiceName()
+		svc := s.svcs.svcMap[serviceName]
+		svcInfo := svc.svcInfo
+		if methodName == "" && svcInfo.ServiceName != serviceinfo.GenericService {
 			return errors.New("method name is empty in rpcinfo, should not happen")
 		}
 		defer func() {
 			if handlerErr := recover(); handlerErr != nil {
-				err = kerrors.ErrPanic.WithCauseAndStack(fmt.Errorf("[happened in biz handler] %s", handlerErr), string(debug.Stack()))
+				err = kerrors.ErrPanic.WithCauseAndStack(
+					fmt.Errorf(
+						"[happened in biz handler, method=%s.%s, please check the panic at the server side] %s",
+						svcInfo.ServiceName, methodName, handlerErr),
+					string(debug.Stack()))
 				rpcStats := rpcinfo.AsMutableRPCStats(ri.Stats())
 				rpcStats.SetPanicked(err)
 			}
-			internal_stats.Record(ctx, ri, stats.ServerHandleFinish, err)
+			rpcinfo.Record(ctx, ri, stats.ServerHandleFinish, err)
+			// clear session
+			backup.ClearCtx()
 		}()
-		implHandlerFunc := s.svcInfo.MethodInfo(methodName).Handler()
-		internal_stats.Record(ctx, ri, stats.ServerHandleStart, nil)
-		err = implHandlerFunc(ctx, s.handler, args, resp)
+		minfo := svcInfo.MethodInfo(methodName)
+		implHandlerFunc := minfo.Handler()
+		rpcinfo.Record(ctx, ri, stats.ServerHandleStart, nil)
+		// set session
+		backup.BackupCtx(ctx)
+
+		err = implHandlerFunc(ctx, svc.handler, args, resp)
 		if err != nil {
 			if bizErr, ok := kerrors.FromBizStatusError(err); ok {
 				if setter, ok := ri.Invocation().(rpcinfo.InvocationSetter); ok {
@@ -303,7 +421,8 @@ func (s *server) invokeHandleEndpoint() endpoint.Endpoint {
 
 func (s *server) initBasicRemoteOption() {
 	remoteOpt := s.opt.RemoteOpt
-	remoteOpt.SvcInfo = s.svcInfo
+	remoteOpt.TargetSvcInfo = s.targetSvcInfo
+	remoteOpt.SvcSearcher = s.svcs
 	remoteOpt.InitOrResetRPCInfoFunc = s.initOrResetRPCInfoFunc()
 	remoteOpt.TracerCtl = s.opt.TracerCtl
 	remoteOpt.ReadWriteTimeout = s.opt.Configs.ReadWriteTimeout()
@@ -334,10 +453,9 @@ func (s *server) addBoundHandlers(opt *remote.ServerOption) {
 		}
 	}
 
-	// for server limiter, the handler should be added as first one
 	limitHdlr := s.buildLimiterWithOpt()
 	if limitHdlr != nil {
-		doAddBoundHandlerToHead(limitHdlr, opt)
+		doAddBoundHandler(limitHdlr, opt)
 	}
 }
 
@@ -358,15 +476,17 @@ func (s *server) buildLimiterWithOpt() (handler remote.InboundHandler) {
 	if limits == nil && connLimit == nil && qpsLimit == nil {
 		return
 	}
+
 	if connLimit == nil {
-		if limits != nil && limits.MaxConnections > 0 {
+		if limits != nil {
 			connLimit = limiter.NewConnectionLimiter(limits.MaxConnections)
 		} else {
 			connLimit = &limiter.DummyConcurrencyLimiter{}
 		}
 	}
+
 	if qpsLimit == nil {
-		if limits != nil && limits.MaxQPS > 0 {
+		if limits != nil {
 			interval := time.Millisecond * 100 // FIXME: should not care this implementation-specific parameter
 			qpsLimit = limiter.NewQPSLimiter(interval, limits.MaxQPS)
 		} else {
@@ -375,23 +495,19 @@ func (s *server) buildLimiterWithOpt() (handler remote.InboundHandler) {
 	} else {
 		s.opt.Limit.QPSLimitPostDecode = true
 	}
+
 	if limits != nil && limits.UpdateControl != nil {
 		updater := limiter.NewLimiterWrapper(connLimit, qpsLimit)
 		limits.UpdateControl(updater)
 	}
+
 	handler = bound.NewServerLimiterHandler(connLimit, qpsLimit, s.opt.Limit.LimitReporter, s.opt.Limit.QPSLimitPostDecode)
 	// TODO: gRPC limiter
 	return
 }
 
 func (s *server) check() error {
-	if s.svcInfo == nil {
-		return errors.New("run: no service. Use RegisterService to set one")
-	}
-	if s.handler == nil || reflect.ValueOf(s.handler).IsNil() {
-		return errors.New("run: handler is nil")
-	}
-	return nil
+	return s.svcs.check(s.opt.RefuseTrafficWithoutServiceName)
 }
 
 func doAddBoundHandlerToHead(h remote.BoundHandler, opt *remote.ServerOption) {
@@ -451,30 +567,37 @@ func (s *server) buildRegistryInfo(lAddr net.Addr) {
 		s.opt.RegistryInfo = &registry.Info{}
 	}
 	info := s.opt.RegistryInfo
-	// notice: lAddr may be nil when listen failed
-	info.Addr = lAddr
+	if !info.SkipListenAddr {
+		// notice: lAddr may be nil when listen failed
+		info.Addr = lAddr
+	}
 	if info.ServiceName == "" {
 		info.ServiceName = s.opt.Svr.ServiceName
 	}
 	if info.PayloadCodec == "" {
-		info.PayloadCodec = s.opt.RemoteOpt.SvcInfo.PayloadCodec.String()
+		info.PayloadCodec = getDefaultSvcInfo(s.svcs).PayloadCodec.String()
 	}
 	if info.Weight == 0 {
 		info.Weight = discovery.DefaultWeight
 	}
+	if info.Tags == nil {
+		info.Tags = s.opt.Svr.Tags
+	}
 }
 
 func (s *server) fillMoreServiceInfo(lAddr net.Addr) {
-	ni := *s.svcInfo
-	si := &ni
-	extra := make(map[string]interface{}, len(si.Extra)+2)
-	for k, v := range si.Extra {
-		extra[k] = v
+	for _, svc := range s.svcs.svcMap {
+		ni := *svc.svcInfo
+		si := &ni
+		extra := make(map[string]interface{}, len(si.Extra)+2)
+		for k, v := range si.Extra {
+			extra[k] = v
+		}
+		extra["address"] = lAddr
+		extra["transports"] = s.opt.SupportedTransportsFunc(*s.opt.RemoteOpt)
+		si.Extra = extra
+		svc.svcInfo = si
 	}
-	extra["address"] = lAddr
-	extra["transports"] = s.opt.SupportedTransportsFunc(*s.opt.RemoteOpt)
-	si.Extra = extra
-	s.svcInfo = si
 }
 
 func (s *server) waitExit(errCh chan error) error {
@@ -497,4 +620,21 @@ func (s *server) waitExit(errCh chan error) error {
 			s.Unlock()
 		}
 	}
+}
+
+func (s *server) findAndSetDefaultService() {
+	if len(s.svcs.svcMap) == 1 {
+		s.targetSvcInfo = getDefaultSvcInfo(s.svcs)
+	}
+}
+
+// getDefaultSvc is used to get one ServiceInfo from map
+func getDefaultSvcInfo(svcs *services) *serviceinfo.ServiceInfo {
+	if len(svcs.svcMap) > 1 && svcs.fallbackSvc != nil {
+		return svcs.fallbackSvc.svcInfo
+	}
+	for _, svc := range svcs.svcMap {
+		return svc.svcInfo
+	}
+	return nil
 }

@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -36,22 +35,33 @@ import (
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
+var _ Closer = &httpPbThriftCodec{}
+
 type httpPbThriftCodec struct {
-	svcDsc     atomic.Value // *idl
-	pbSvcDsc   atomic.Value // *pbIdl
-	provider   DescriptorProvider
-	pbProvider PbDescriptorProvider
-	codec      remote.PayloadCodec
+	svcDsc       atomic.Value // *idl
+	pbSvcDsc     atomic.Value // *pbIdl
+	provider     DescriptorProvider
+	pbProvider   PbDescriptorProvider
+	svcName      string
+	extra        map[string]string
+	readerWriter atomic.Value // *thrift.HTTPPbReaderWriter
 }
 
-func newHTTPPbThriftCodec(p DescriptorProvider, pbp PbDescriptorProvider, codec remote.PayloadCodec) (*httpPbThriftCodec, error) {
+func newHTTPPbThriftCodec(p DescriptorProvider, pbp PbDescriptorProvider) *httpPbThriftCodec {
 	svc := <-p.Provide()
 	pbSvc := <-pbp.Provide()
-	c := &httpPbThriftCodec{codec: codec, provider: p, pbProvider: pbp}
+	c := &httpPbThriftCodec{
+		provider:   p,
+		pbProvider: pbp,
+		svcName:    svc.Name,
+		extra:      make(map[string]string),
+	}
+	c.setCombinedServices(svc.IsCombinedServices)
 	c.svcDsc.Store(svc)
 	c.pbSvcDsc.Store(pbSvc)
+	c.readerWriter.Store(thrift.NewHTTPPbReaderWriter(svc, pbSvc))
 	go c.update()
-	return c, nil
+	return c
 }
 
 func (c *httpPbThriftCodec) update() {
@@ -66,8 +76,19 @@ func (c *httpPbThriftCodec) update() {
 			return
 		}
 
+		c.svcName = svc.Name
+		c.setCombinedServices(svc.IsCombinedServices)
 		c.svcDsc.Store(svc)
 		c.pbSvcDsc.Store(pbSvc)
+		c.readerWriter.Store(thrift.NewHTTPPbReaderWriter(svc, pbSvc))
+	}
+}
+
+func (c *httpPbThriftCodec) setCombinedServices(isCombinedServices bool) {
+	if isCombinedServices {
+		c.extra[CombineServiceKey] = "true"
+	} else {
+		c.extra[CombineServiceKey] = "false"
 	}
 }
 
@@ -84,40 +105,16 @@ func (c *httpPbThriftCodec) getMethod(req interface{}) (*Method, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Method{function.Name, function.Oneway}, nil
+	return &Method{function.Name, function.Oneway, function.StreamingMode}, nil
 }
 
-func (c *httpPbThriftCodec) Marshal(ctx context.Context, msg remote.Message, out remote.ByteBuffer) error {
-	svcDsc, ok := c.svcDsc.Load().(*descriptor.ServiceDescriptor)
-	if !ok {
-		return fmt.Errorf("get parser ServiceDescriptor failed")
+func (c *httpPbThriftCodec) getMessageReaderWriter() interface{} {
+	v := c.readerWriter.Load()
+	if rw, ok := v.(*thrift.HTTPPbReaderWriter); !ok {
+		panic(fmt.Sprintf("get readerWriter failed: expected *thrift.HTTPPbReaderWriter, got %T", v))
+	} else {
+		return rw
 	}
-	pbSvcDsc, ok := c.pbSvcDsc.Load().(*desc.ServiceDescriptor)
-	if !ok {
-		return fmt.Errorf("get parser PbServiceDescriptor failed")
-	}
-
-	inner := thrift.NewWriteHTTPPbRequest(svcDsc, pbSvcDsc)
-	msg.Data().(WithCodec).SetCodec(inner)
-	return c.codec.Marshal(ctx, msg, out)
-}
-
-func (c *httpPbThriftCodec) Unmarshal(ctx context.Context, msg remote.Message, in remote.ByteBuffer) error {
-	if err := codec.NewDataIfNeeded(serviceinfo.GenericMethod, msg); err != nil {
-		return err
-	}
-	svcDsc, ok := c.svcDsc.Load().(*descriptor.ServiceDescriptor)
-	if !ok {
-		return fmt.Errorf("get parser ServiceDescriptor failed")
-	}
-	pbSvcDsc, ok := c.pbSvcDsc.Load().(proto.ServiceDescriptor)
-	if !ok {
-		return fmt.Errorf("get parser PbServiceDescriptor failed")
-	}
-
-	inner := thrift.NewReadHTTPPbResponse(svcDsc, pbSvcDsc)
-	msg.Data().(WithCodec).SetCodec(inner)
-	return c.codec.Unmarshal(ctx, msg, in)
 }
 
 func (c *httpPbThriftCodec) Name() string {
@@ -140,21 +137,47 @@ func (c *httpPbThriftCodec) Close() error {
 	}
 }
 
+// Deprecated: it's not used by kitex anymore. replaced by generic.MessageReaderWriter
+func (c *httpPbThriftCodec) Marshal(ctx context.Context, msg remote.Message, out remote.ByteBuffer) error {
+	svcDsc, ok := c.svcDsc.Load().(*descriptor.ServiceDescriptor)
+	if !ok {
+		return errors.New("get parser ServiceDescriptor failed")
+	}
+	pbSvcDsc, ok := c.pbSvcDsc.Load().(*desc.ServiceDescriptor)
+	if !ok {
+		return errors.New("get parser PbServiceDescriptor failed")
+	}
+
+	inner := thrift.NewWriteHTTPPbRequest(svcDsc, pbSvcDsc)
+	msg.Data().(WithCodec).SetCodec(inner)
+	return thriftCodec.Marshal(ctx, msg, out)
+}
+
+// Deprecated: it's not used by kitex anymore. replaced by generic.MessageReaderWriter
+func (c *httpPbThriftCodec) Unmarshal(ctx context.Context, msg remote.Message, in remote.ByteBuffer) error {
+	if err := codec.NewDataIfNeeded(serviceinfo.GenericMethod, msg); err != nil {
+		return err
+	}
+	svcDsc, ok := c.svcDsc.Load().(*descriptor.ServiceDescriptor)
+	if !ok {
+		return errors.New("get parser ServiceDescriptor failed")
+	}
+	pbSvcDsc, ok := c.pbSvcDsc.Load().(proto.ServiceDescriptor)
+	if !ok {
+		return errors.New("get parser PbServiceDescriptor failed")
+	}
+
+	inner := thrift.NewReadHTTPPbResponse(svcDsc, pbSvcDsc)
+	msg.Data().(WithCodec).SetCodec(inner)
+	return thriftCodec.Unmarshal(ctx, msg, in)
+}
+
 // FromHTTPPbRequest parse  HTTPRequest from http.Request
 func FromHTTPPbRequest(req *http.Request) (*HTTPRequest, error) {
 	customReq := &HTTPRequest{
-		Header:      req.Header,
-		Query:       req.URL.Query(),
-		Cookies:     descriptor.Cookies{},
-		Method:      req.Method,
-		Host:        req.Host,
-		Path:        req.URL.Path,
+		Request:     req,
 		ContentType: descriptor.MIMEApplicationProtobuf,
 	}
-	for _, cookie := range req.Cookies() {
-		customReq.Cookies[cookie.Name] = cookie.Value
-	}
-	// copy the request body, maybe user used it after parse
 	var b io.ReadCloser
 	var err error
 	if req.GetBody != nil {
@@ -169,7 +192,7 @@ func FromHTTPPbRequest(req *http.Request) (*HTTPRequest, error) {
 		// body == nil if from Get request
 		return customReq, nil
 	}
-	if customReq.RawBody, err = ioutil.ReadAll(b); err != nil {
+	if customReq.RawBody, err = io.ReadAll(b); err != nil {
 		return nil, err
 	}
 	if len(customReq.RawBody) == 0 {

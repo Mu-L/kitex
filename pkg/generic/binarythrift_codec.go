@@ -21,14 +21,19 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/bytedance/gopkg/lang/dirtmake"
+
+	"github.com/cloudwego/kitex/pkg/generic/thrift"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/codec"
 	"github.com/cloudwego/kitex/pkg/remote/codec/perrors"
-	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
-var _ remote.PayloadCodec = &binaryThriftCodec{}
+var (
+	_  remote.PayloadCodec = &binaryThriftCodec{}
+	wb                     = thrift.NewWriteBinary()
+)
 
 type binaryReqType = []byte
 
@@ -42,9 +47,6 @@ func (c *binaryThriftCodec) Marshal(ctx context.Context, msg remote.Message, out
 		return perrors.NewProtocolErrorWithMsg("invalid marshal data in rawThriftBinaryCodec: nil")
 	}
 	if msg.MessageType() == remote.Exception {
-		if ink, ok := msg.RPCInfo().Invocation().(rpcinfo.InvocationSetter); ok {
-			ink.SetMethodName(serviceinfo.GenericMethod)
-		}
 		if err := c.thriftCodec.Marshal(ctx, msg, out); err != nil {
 			return perrors.NewProtocolErrorWithMsg(fmt.Sprintf("rawThriftBinaryCodec Marshal exception failed, err: %s", err.Error()))
 		}
@@ -53,6 +55,12 @@ func (c *binaryThriftCodec) Marshal(ctx context.Context, msg remote.Message, out
 	var transBuff []byte
 	var ok bool
 	if msg.RPCRole() == remote.Server {
+		// Business error only works properly when using TTHeader and HTTP2 transmission protocols
+		// If there is a business error, data.(*Result).Success will be nil, and an empty payload will be constructed here to return
+		if msg.RPCInfo().Invocation().BizStatusErr() != nil {
+			msg.Data().(WithCodec).SetCodec(wb)
+			return thriftCodec.Marshal(ctx, msg, out)
+		}
 		gResult := data.(*Result)
 		transBinary := gResult.Success
 		if transBuff, ok = transBinary.(binaryReqType); !ok {
@@ -68,8 +76,8 @@ func (c *binaryThriftCodec) Marshal(ctx context.Context, msg remote.Message, out
 			return perrors.NewProtocolErrorWithMsg(fmt.Sprintf("rawThriftBinaryCodec set seqID failed, err: %s", err.Error()))
 		}
 	}
-	out.WriteBinary(transBuff)
-	return nil
+	_, err := out.WriteBinary(transBuff)
+	return err
 }
 
 func (c *binaryThriftCodec) Unmarshal(ctx context.Context, msg remote.Message, in remote.ByteBuffer) error {
@@ -82,7 +90,8 @@ func (c *binaryThriftCodec) Unmarshal(ctx context.Context, msg remote.Message, i
 		return c.thriftCodec.Unmarshal(ctx, msg, in)
 	}
 	payloadLen := msg.PayloadLen()
-	transBuff, err := in.ReadBinary(payloadLen)
+	transBuff := dirtmake.Bytes(payloadLen, payloadLen)
+	_, err = in.ReadBinary(transBuff)
 	if err != nil {
 		return err
 	}

@@ -21,7 +21,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/cloudwego/gopkg/protocol/thrift"
 
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
@@ -29,10 +29,14 @@ import (
 // method name of mock
 const (
 	MockServiceName            = "MockService"
+	MockService2Name           = "MockService2"
+	MockService3Name           = "MockService3"
 	MockMethod          string = "mock"
+	Mock2Method         string = "mock2"
 	MockExceptionMethod string = "mockException"
 	MockErrorMethod     string = "mockError"
 	MockOnewayMethod    string = "mockOneway"
+	MockStreamingMethod string = "mockStreaming"
 )
 
 // ServiceInfo return mock serviceInfo
@@ -48,6 +52,10 @@ func newServiceInfo() *serviceinfo.ServiceInfo {
 		"mockException": serviceinfo.NewMethodInfo(mockExceptionHandler, NewMockArgs, newMockExceptionResult, false),
 		"mockError":     serviceinfo.NewMethodInfo(mockErrorHandler, NewMockArgs, NewMockResult, false),
 		"mockOneway":    serviceinfo.NewMethodInfo(mockOnewayHandler, NewMockArgs, nil, true),
+		"mockStreaming": serviceinfo.NewMethodInfo(
+			nil, nil, nil, false,
+			serviceinfo.WithStreamingMode(serviceinfo.StreamingBidirectional),
+		),
 	}
 
 	svcInfo := &serviceinfo.ServiceInfo{
@@ -60,7 +68,62 @@ func newServiceInfo() *serviceinfo.ServiceInfo {
 	return svcInfo
 }
 
+// Service2Info return mock serviceInfo
+func Service2Info() *serviceinfo.ServiceInfo {
+	return myServiceService2Info
+}
+
+var myServiceService2Info = newService2Info()
+
+func newService2Info() *serviceinfo.ServiceInfo {
+	methods := map[string]serviceinfo.MethodInfo{
+		"mock2": serviceinfo.NewMethodInfo(mock2Handler, NewMockArgs, NewMockResult, false),
+	}
+
+	svcInfo := &serviceinfo.ServiceInfo{
+		ServiceName: MockService2Name,
+		Methods:     methods,
+		Extra: map[string]interface{}{
+			"PackageName": "mock2",
+		},
+	}
+	return svcInfo
+}
+
+// Service3Info return mock serviceInfo
+func Service3Info() *serviceinfo.ServiceInfo {
+	return myServiceService3Info
+}
+
+var myServiceService3Info = newService3Info()
+
+func newService3Info() *serviceinfo.ServiceInfo {
+	methods := map[string]serviceinfo.MethodInfo{
+		"mock": serviceinfo.NewMethodInfo(mockHandler, NewMockArgs, NewMockResult, false),
+	}
+
+	svcInfo := &serviceinfo.ServiceInfo{
+		ServiceName: MockService3Name,
+		Methods:     methods,
+		Extra: map[string]interface{}{
+			"PackageName": "mock",
+		},
+	}
+	return svcInfo
+}
+
 func mockHandler(ctx context.Context, handler, args, result interface{}) error {
+	a := args.(*myServiceMockArgs)
+	r := result.(*myServiceMockResult)
+	reply, err := handler.(MyService).Mock(ctx, a.Req)
+	if err != nil {
+		return err
+	}
+	r.Success = reply
+	return nil
+}
+
+func mock2Handler(ctx context.Context, handler, args, result interface{}) error {
 	a := args.(*myServiceMockArgs)
 	r := result.(*myServiceMockResult)
 	reply, err := handler.(MyService).Mock(ctx, a.Req)
@@ -126,19 +189,16 @@ type MyService interface {
 	MockException(ctx context.Context, req *MyRequest) (r *MyResponse, err error)
 	MockError(ctx context.Context, req *MyRequest) (r *MyResponse, err error)
 	MockOneway(ctx context.Context, req *MyRequest) (err error)
+	Mock2(ctx context.Context, req *MyRequest) (r *MyResponse, err error)
 }
 
 type myServiceMockArgs struct {
 	Req *MyRequest `thrift:"req,1" json:"req"`
 }
 
-func (p *myServiceMockArgs) Read(iprot thrift.TProtocol) error {
-	return nil
-}
-
-func (p *myServiceMockArgs) Write(oprot thrift.TProtocol) error {
-	return nil
-}
+func (p *myServiceMockArgs) BLength() int                                           { return 1 }
+func (p *myServiceMockArgs) FastWriteNocopy(buf []byte, bw thrift.NocopyWriter) int { return 1 }
+func (p *myServiceMockArgs) FastRead(buf []byte) (int, error)                       { return 1, nil }
 
 // MyRequest .
 type MyRequest struct {
@@ -149,13 +209,9 @@ type myServiceMockResult struct {
 	Success *MyResponse `thrift:"success,0" json:"success,omitempty"`
 }
 
-func (p *myServiceMockResult) Read(iprot thrift.TProtocol) error {
-	return nil
-}
-
-func (p *myServiceMockResult) Write(oprot thrift.TProtocol) error {
-	return nil
-}
+func (p *myServiceMockResult) BLength() int                                           { return 1 }
+func (p *myServiceMockResult) FastWriteNocopy(buf []byte, bw thrift.NocopyWriter) int { return 1 }
+func (p *myServiceMockResult) FastRead(buf []byte) (int, error)                       { return 1, nil }
 
 // MyResponse .
 type MyResponse struct {
@@ -167,13 +223,11 @@ type myServiceMockExceptionResult struct {
 	MyException *MyException `thrift:"stException,1" json:"stException,omitempty"`
 }
 
-func (p *myServiceMockExceptionResult) Read(iprot thrift.TProtocol) error {
-	return nil
+func (p *myServiceMockExceptionResult) BLength() int { return 1 }
+func (p *myServiceMockExceptionResult) FastWriteNocopy(buf []byte, bw thrift.NocopyWriter) int {
+	return 1
 }
-
-func (p *myServiceMockExceptionResult) Write(oprot thrift.TProtocol) error {
-	return nil
-}
+func (p *myServiceMockExceptionResult) FastRead(buf []byte) (int, error) { return 1, nil }
 
 // MyException .
 type MyException struct {
@@ -203,6 +257,13 @@ func (h *myServiceHandler) Mock(ctx context.Context, req *MyRequest) (r *MyRespo
 		return h.mockFunc(ctx, req)
 	}
 	return &MyResponse{Name: MockMethod}, nil
+}
+
+func (h *myServiceHandler) Mock2(ctx context.Context, req *MyRequest) (r *MyResponse, err error) {
+	if h.mockFunc != nil {
+		return h.mockFunc(ctx, req)
+	}
+	return &MyResponse{Name: Mock2Method}, nil
 }
 
 func (h *myServiceHandler) MockException(ctx context.Context, req *MyRequest) (r *MyResponse, err error) {

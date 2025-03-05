@@ -26,24 +26,28 @@ import (
 
 // Basic error types
 var (
-	ErrInternalException = &basicError{"internal exception"}
-	ErrServiceDiscovery  = &basicError{"service discovery error"}
-	ErrGetConnection     = &basicError{"get connection error"}
-	ErrLoadbalance       = &basicError{"loadbalance error"}
-	ErrNoMoreInstance    = &basicError{"no more instances to retry"}
-	ErrRPCTimeout        = &basicError{"rpc timeout"}
-	ErrACL               = &basicError{"request forbidden"}
-	ErrCircuitBreak      = &basicError{"forbidden by circuitbreaker"}
-	ErrRemoteOrNetwork   = &basicError{"remote or network error"}
-	ErrOverlimit         = &basicError{"request over limit"}
-	ErrPanic             = &basicError{"panic"}
-	ErrBiz               = &basicError{"biz error"}
+	ErrInternalException  = &basicError{"internal exception"}
+	ErrServiceDiscovery   = &basicError{"service discovery error"}
+	ErrGetConnection      = &basicError{"get connection error"}
+	ErrLoadbalance        = &basicError{"loadbalance error"}
+	ErrNoMoreInstance     = &basicError{"no more instances to retry"}
+	ErrRPCTimeout         = &basicError{"rpc timeout"}
+	ErrCanceledByBusiness = &basicError{"canceled by business"}
+	ErrTimeoutByBusiness  = &basicError{"timeout by business"}
+	ErrACL                = &basicError{"request forbidden"}
+	ErrCircuitBreak       = &basicError{"forbidden by circuitbreaker"}
+	ErrRemoteOrNetwork    = &basicError{"remote or network error"}
+	ErrOverlimit          = &basicError{"request over limit"}
+	ErrPanic              = &basicError{"panic"}
+	ErrBiz                = &basicError{"biz error"}
 
 	ErrRetry = &basicError{"retry error"}
 	// ErrRPCFinish happens when retry enabled and there is one call has finished
 	ErrRPCFinish = &basicError{"rpc call finished"}
 	// ErrRoute happens when router fail to route this call
 	ErrRoute = &basicError{"rpc route failed"}
+	// ErrPayloadValidation happens when payload validation failed
+	ErrPayloadValidation = &basicError{"payload validation error"}
 )
 
 // More detailed error types

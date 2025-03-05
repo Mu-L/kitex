@@ -21,7 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"path"
@@ -30,7 +30,6 @@ import (
 
 	"github.com/cloudwego/netpoll"
 
-	stats2 "github.com/cloudwego/kitex/internal/stats"
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
@@ -58,10 +57,10 @@ type httpCliTransHandler struct {
 func (t *httpCliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (nctx context.Context, err error) {
 	var bufWriter remote.ByteBuffer
 	ri := sendMsg.RPCInfo()
-	stats2.Record(ctx, ri, stats.WriteStart, nil)
+	rpcinfo.Record(ctx, ri, stats.WriteStart, nil)
 	defer func() {
 		t.ext.ReleaseBuffer(bufWriter, err)
-		stats2.Record(ctx, ri, stats.WriteFinish, err)
+		rpcinfo.Record(ctx, ri, stats.WriteFinish, err)
 	}()
 
 	bufWriter = t.ext.NewWriteByteBuffer(ctx, conn, sendMsg)
@@ -103,10 +102,10 @@ func (t *httpCliTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg 
 // Read implements the remote.ClientTransHandler interface. Read is blocked.
 func (t *httpCliTransHandler) Read(ctx context.Context, conn net.Conn, msg remote.Message) (nctx context.Context, err error) {
 	var bufReader remote.ByteBuffer
-	stats2.Record(ctx, msg.RPCInfo(), stats.ReadStart, nil)
+	rpcinfo.Record(ctx, msg.RPCInfo(), stats.ReadStart, nil)
 	defer func() {
 		t.ext.ReleaseBuffer(bufReader, err)
-		stats2.Record(ctx, msg.RPCInfo(), stats.ReadFinish, err)
+		rpcinfo.Record(ctx, msg.RPCInfo(), stats.ReadFinish, err)
 	}()
 
 	t.ext.SetReadTimeout(ctx, conn, msg.RPCInfo().Config(), remote.Client)
@@ -140,10 +139,9 @@ func (t *httpCliTransHandler) OnInactive(ctx context.Context, conn net.Conn) {
 // OnError implements the remote.ClientTransHandler interface.
 // This is called when panic happens.
 func (t *httpCliTransHandler) OnError(ctx context.Context, err error, conn net.Conn) {
-	if pe, ok := err.(*kerrors.DetailedError); ok {
+	var pe *kerrors.DetailedError
+	if errors.As(err, &pe) {
 		klog.CtxErrorf(ctx, "KITEX: send http request error, remote=%s, error=%s\nstack=%s", conn.RemoteAddr(), err.Error(), pe.Stack())
-	} else {
-		klog.CtxErrorf(ctx, "KITEX: send http request error, remote=%s, error=%s", conn.RemoteAddr(), err.Error())
 	}
 }
 
@@ -279,7 +277,7 @@ func getBodyBufReader(buf remote.ByteBuffer) (remote.ByteBuffer, error) {
 	if hr.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("http response not OK, StatusCode: %d", hr.StatusCode)
 	}
-	b, err := ioutil.ReadAll(hr.Body)
+	b, err := io.ReadAll(hr.Body)
 	hr.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("read http response body error:%w", err)

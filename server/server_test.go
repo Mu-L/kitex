@@ -19,7 +19,9 @@ package server
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -27,6 +29,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bytedance/gopkg/cloud/metainfo"
+	"github.com/cloudwego/localsession"
+	"github.com/cloudwego/localsession/backup"
 	"github.com/golang/mock/gomock"
 
 	"github.com/cloudwego/kitex/internal/mocks"
@@ -40,24 +45,69 @@ import (
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/bound"
 	"github.com/cloudwego/kitex/pkg/remote/trans"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
+	"github.com/cloudwego/kitex/pkg/streaming"
 	"github.com/cloudwego/kitex/pkg/transmeta"
 	"github.com/cloudwego/kitex/pkg/utils"
 	"github.com/cloudwego/kitex/transport"
 )
 
+var svcInfo = mocks.ServiceInfo()
+
+// NOTE: always use this method to get addr for server listening
+// should be used with `WithServiceAddr(addr)`
+func getAddrForListener() net.Addr {
+	addr := test.GetLocalAddress()
+	ret, _ := net.ResolveTCPAddr("tcp", addr)
+	return ret
+}
+
+// NewTestServer calls NewServer with a random addr
+// DO NOT USE `NewServer` and `s.Run()` without specifying addr, it listens on :8888 ...
+func NewTestServer(ops ...Option) (Server, net.Addr) {
+	addr := getAddrForListener()
+	svr := NewServer(append(ops, WithServiceAddr(addr))...)
+	return svr, addr
+}
+
+// WaitServer waits utils its listener is ready
+func WaitServer(s Server) {
+	// sleep 5ms, and likely it's up
+	time.Sleep(5 * time.Millisecond)
+	// wait at most 100*10ms ~ 1s or panic
+	for i := 0; i < 100; i++ {
+		svr := s.(*server)
+		svr.Lock()
+		remotesvr := svr.svr
+		svr.Unlock()
+		if remotesvr == nil || remotesvr.Address() == nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		a := remotesvr.Address()
+		log.Printf("[WaitServer] %s/%s is up", a.Network(), a.String())
+		return
+	}
+	panic("server " + s.(*server).svr.Address().String() + " not ready")
+}
+
+func goWaitAndStop(t *testing.T, s Server) {
+	go func() {
+		WaitServer(s)
+		// give more time for server to init other stuffs after listener is ready
+		time.Sleep(10 * time.Millisecond)
+		err := s.Stop()
+		test.Assert(t, err == nil, err)
+	}()
+}
+
 func TestServerRun(t *testing.T) {
 	var opts []Option
 	opts = append(opts, WithMetaHandler(noopMetahandler{}))
-	svr := NewServer(opts...)
-
-	time.AfterFunc(time.Second, func() {
-		err := svr.Stop()
-		test.Assert(t, err == nil, err)
-	})
-
+	svr, _ := NewTestServer(opts...)
 	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
 	test.Assert(t, err == nil)
 
@@ -69,6 +119,8 @@ func TestServerRun(t *testing.T) {
 	RegisterShutdownHook(func() {
 		atomic.AddInt32(&shutdownHook, 1)
 	})
+
+	goWaitAndStop(t, svr)
 	err = svr.Run()
 	test.Assert(t, err == nil, err)
 
@@ -77,10 +129,10 @@ func TestServerRun(t *testing.T) {
 }
 
 func TestReusePortServerRun(t *testing.T) {
-	addr, _ := net.ResolveTCPAddr("tcp", ":19999")
+	addr := getAddrForListener()
 	var opts []Option
 	opts = append(opts, WithReusePort(true))
-	opts = append(opts, WithServiceAddr(addr))
+	opts = append(opts, WithServiceAddr(addr), WithExitWaitTime(time.Microsecond*10))
 
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -107,7 +159,8 @@ func TestInitOrResetRPCInfo(t *testing.T) {
 	rwTimeout := time.Millisecond
 	opts = append(opts, WithReadWriteTimeout(rwTimeout))
 	svr := &server{
-		opt: internal_server.NewOptions(opts),
+		opt:  internal_server.NewOptions(opts),
+		svcs: newServices(),
 	}
 	svr.init()
 	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
@@ -188,7 +241,10 @@ func TestInitOrResetRPCInfo(t *testing.T) {
 	test.Assert(t, ri.Stats().Level() == stats.LevelDetailed)
 
 	// test reset
+	pOld := reflect.ValueOf(ri).Pointer()
 	ri = rpcInfoInitFunc(ri, conn.RemoteAddr())
+	pNew := reflect.ValueOf(ri).Pointer()
+	test.Assert(t, pOld == pNew, pOld, pNew)
 	test.Assert(t, ri.From().Address().String() == remoteAddr.String())
 	test.Assert(t, ri.Config().ReadWriteTimeout() == rwTimeout)
 
@@ -220,9 +276,22 @@ func TestInitOrResetRPCInfo(t *testing.T) {
 	test.Assert(t, panicked == nil)
 	test.Assert(t, ri.Stats().Error() == nil)
 	test.Assert(t, ri.Stats().Level() == 0)
+
+	// test reset after rpcInfoPool is disabled
+	t.Run("reset with pool disabled", func(t *testing.T) {
+		backupState := rpcinfo.PoolEnabled()
+		defer rpcinfo.EnablePool(backupState)
+		rpcinfo.EnablePool(false)
+
+		riNew := rpcInfoInitFunc(ri, conn.RemoteAddr())
+		pOld, pNew := reflect.ValueOf(ri).Pointer(), reflect.ValueOf(riNew).Pointer()
+		test.Assert(t, pOld != pNew, pOld, pNew)
+	})
 }
 
 func TestServiceRegisterFailed(t *testing.T) {
+	t.Parallel() // slow test, use Parallel
+
 	mockRegErr := errors.New("mock register error")
 	var rCount int
 	var drCount int
@@ -238,7 +307,7 @@ func TestServiceRegisterFailed(t *testing.T) {
 	}
 	var opts []Option
 	opts = append(opts, WithRegistry(mockRegistry))
-	svr := NewServer(opts...)
+	svr, _ := NewTestServer(opts...)
 	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
 	test.Assert(t, err == nil)
 
@@ -249,6 +318,8 @@ func TestServiceRegisterFailed(t *testing.T) {
 }
 
 func TestServiceDeregisterFailed(t *testing.T) {
+	t.Parallel() // slow test, use Parallel
+
 	mockDeregErr := errors.New("mock deregister error")
 	var rCount int
 	var drCount int
@@ -264,11 +335,11 @@ func TestServiceDeregisterFailed(t *testing.T) {
 	}
 	var opts []Option
 	opts = append(opts, WithRegistry(mockRegistry))
-	svr := NewServer(opts...)
+	svr, _ := NewTestServer(opts...)
 	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
 	test.Assert(t, err == nil)
 
-	time.AfterFunc(3500*time.Millisecond, func() {
+	time.AfterFunc(2000*time.Millisecond, func() {
 		err := svr.Stop()
 		test.Assert(t, strings.Contains(err.Error(), mockDeregErr.Error()))
 	})
@@ -278,6 +349,8 @@ func TestServiceDeregisterFailed(t *testing.T) {
 }
 
 func TestServiceRegistryInfo(t *testing.T) {
+	t.Parallel() // slow test, use Parallel
+
 	registryInfo := &registry.Info{
 		Weight: 100,
 		Tags:   map[string]string{"aa": "bb"},
@@ -285,7 +358,6 @@ func TestServiceRegistryInfo(t *testing.T) {
 	checkInfo := func(info *registry.Info) {
 		test.Assert(t, info.PayloadCodec == serviceinfo.Thrift.String(), info.PayloadCodec)
 		test.Assert(t, info.Weight == registryInfo.Weight, info.Addr)
-		test.Assert(t, info.Addr.String() == "[::]:8888", info.Addr)
 		test.Assert(t, len(info.Tags) == len(registryInfo.Tags), info.Tags)
 		test.Assert(t, info.Tags["aa"] == registryInfo.Tags["aa"], info.Tags)
 	}
@@ -306,11 +378,11 @@ func TestServiceRegistryInfo(t *testing.T) {
 	var opts []Option
 	opts = append(opts, WithRegistry(mockRegistry))
 	opts = append(opts, WithRegistryInfo(registryInfo))
-	svr := NewServer(opts...)
+	svr, _ := NewTestServer(opts...)
 	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
 	test.Assert(t, err == nil)
 
-	time.AfterFunc(3500*time.Millisecond, func() {
+	time.AfterFunc(2000*time.Millisecond, func() {
 		err := svr.Stop()
 		test.Assert(t, err == nil, err)
 	})
@@ -321,9 +393,10 @@ func TestServiceRegistryInfo(t *testing.T) {
 }
 
 func TestServiceRegistryNoInitInfo(t *testing.T) {
+	t.Parallel() // slow test, use Parallel
+
 	checkInfo := func(info *registry.Info) {
 		test.Assert(t, info.PayloadCodec == serviceinfo.Thrift.String(), info.PayloadCodec)
-		test.Assert(t, info.Addr.String() == "[::]:8888", info.Addr)
 	}
 	var rCount int
 	var drCount int
@@ -341,11 +414,11 @@ func TestServiceRegistryNoInitInfo(t *testing.T) {
 	}
 	var opts []Option
 	opts = append(opts, WithRegistry(mockRegistry))
-	svr := NewServer(opts...)
+	svr, _ := NewTestServer(opts...)
 	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
 	test.Assert(t, err == nil)
 
-	time.AfterFunc(3500*time.Millisecond, func() {
+	time.AfterFunc(2000*time.Millisecond, func() {
 		err := svr.Stop()
 		test.Assert(t, err == nil, err)
 	})
@@ -353,6 +426,158 @@ func TestServiceRegistryNoInitInfo(t *testing.T) {
 	test.Assert(t, err == nil, err)
 	test.Assert(t, rCount == 1)
 	test.Assert(t, drCount == 1)
+}
+
+// TestServiceRegistryInfoWithNilTags is to check the Tags val. If Tags of RegistryInfo is nil,
+// the Tags of ServerBasicInfo will be assigned to Tags of RegistryInfo
+func TestServiceRegistryInfoWithNilTags(t *testing.T) {
+	t.Parallel() // slow test, use Parallel
+
+	registryInfo := &registry.Info{
+		Weight: 100,
+	}
+	checkInfo := func(info *registry.Info) {
+		test.Assert(t, info.PayloadCodec == serviceinfo.Thrift.String(), info.PayloadCodec)
+		test.Assert(t, info.Weight == registryInfo.Weight, info.Weight)
+		test.Assert(t, info.Tags["aa"] == "bb", info.Tags)
+	}
+	var rCount int
+	var drCount int
+	mockRegistry := MockRegistry{
+		RegisterFunc: func(info *registry.Info) error {
+			checkInfo(info)
+			rCount++
+			return nil
+		},
+		DeregisterFunc: func(info *registry.Info) error {
+			checkInfo(info)
+			drCount++
+			return nil
+		},
+	}
+	var opts []Option
+	opts = append(opts, WithRegistry(mockRegistry))
+	opts = append(opts, WithRegistryInfo(registryInfo))
+	opts = append(opts, WithServerBasicInfo(&rpcinfo.EndpointBasicInfo{
+		Tags: map[string]string{"aa": "bb"},
+	}))
+	svr, _ := NewTestServer(opts...)
+	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
+	test.Assert(t, err == nil)
+
+	time.AfterFunc(2000*time.Millisecond, func() {
+		err := svr.Stop()
+		test.Assert(t, err == nil, err)
+	})
+	err = svr.Run()
+	test.Assert(t, err == nil, err)
+	test.Assert(t, rCount == 1)
+	test.Assert(t, drCount == 1)
+}
+
+func TestServiceRegistryInfoWithSkipListenAddr(t *testing.T) {
+	t.Parallel() // slow test, use Parallel
+
+	realAddr, _ := net.ResolveTCPAddr("tcp", test.GetLocalAddress())
+	registryInfo := &registry.Info{
+		Weight:         100,
+		Addr:           realAddr,
+		SkipListenAddr: true,
+	}
+	checkInfo := func(info *registry.Info) {
+		test.Assert(t, info.Weight == registryInfo.Weight, info.Weight)
+		test.Assert(t, info.SkipListenAddr, info.SkipListenAddr)
+		test.Assert(t, info.Addr.String() == realAddr.String(), info.Addr)
+	}
+	var rCount int
+	var drCount int
+	mockRegistry := MockRegistry{
+		RegisterFunc: func(info *registry.Info) error {
+			checkInfo(info)
+			rCount++
+			return nil
+		},
+		DeregisterFunc: func(info *registry.Info) error {
+			checkInfo(info)
+			drCount++
+			return nil
+		},
+	}
+	var opts []Option
+	opts = append(opts, WithRegistry(mockRegistry))
+	opts = append(opts, WithRegistryInfo(registryInfo))
+	svr, _ := NewTestServer(opts...)
+	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
+	test.Assert(t, err == nil)
+
+	time.AfterFunc(1500*time.Millisecond, func() {
+		err := svr.Stop()
+		test.Assert(t, err == nil, err)
+	})
+	err = svr.Run()
+	test.Assert(t, err == nil, err)
+	test.Assert(t, rCount == 1)
+	test.Assert(t, drCount == 1)
+}
+
+func TestServiceRegistryInfoWithoutSkipListenAddr(t *testing.T) {
+	t.Parallel() // slow test, use Parallel
+
+	realAddr, _ := net.ResolveTCPAddr("tcp", test.GetLocalAddress())
+	registryInfo := &registry.Info{
+		Weight: 100,
+		Addr:   realAddr,
+	}
+	checkInfo := func(info *registry.Info) {
+		test.Assert(t, info.Weight == registryInfo.Weight, info.Weight)
+		test.Assert(t, !info.SkipListenAddr, info.SkipListenAddr)
+		test.Assert(t, info.Addr.String() != realAddr.String(), info.Addr)
+	}
+	var rCount int
+	var drCount int
+	mockRegistry := MockRegistry{
+		RegisterFunc: func(info *registry.Info) error {
+			checkInfo(info)
+			rCount++
+			return nil
+		},
+		DeregisterFunc: func(info *registry.Info) error {
+			checkInfo(info)
+			drCount++
+			return nil
+		},
+	}
+	var opts []Option
+	opts = append(opts, WithRegistry(mockRegistry))
+	opts = append(opts, WithRegistryInfo(registryInfo))
+	svr, _ := NewTestServer(opts...)
+	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
+	test.Assert(t, err == nil)
+
+	time.AfterFunc(1500*time.Millisecond, func() {
+		err := svr.Stop()
+		test.Assert(t, err == nil, err)
+	})
+	err = svr.Run()
+	test.Assert(t, err == nil, err)
+	test.Assert(t, rCount == 1)
+	test.Assert(t, drCount == 1)
+}
+
+func TestGRPCServerMultipleServices(t *testing.T) {
+	var opts []Option
+	opts = append(opts, withGRPCTransport())
+	svr, _ := NewTestServer(opts...)
+	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
+	test.Assert(t, err == nil)
+	err = svr.RegisterService(mocks.Service2Info(), mocks.MyServiceHandler())
+	test.Assert(t, err == nil)
+
+	test.DeepEqual(t, svr.(*server).svcs.SearchService("", mocks.MockMethod, false), mocks.ServiceInfo())
+	test.DeepEqual(t, svr.(*server).svcs.SearchService("", mocks.Mock2Method, false), mocks.Service2Info())
+	goWaitAndStop(t, svr)
+	err = svr.Run()
+	test.Assert(t, err == nil, err)
 }
 
 func TestServerBoundHandler(t *testing.T) {
@@ -374,11 +599,11 @@ func TestServerBoundHandler(t *testing.T) {
 				WithMetaHandler(noopMetahandler{}),
 			},
 			wantInbounds: []remote.InboundHandler{
+				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler, noopMetahandler{}}),
 				bound.NewServerLimiterHandler(limiter.NewConnectionLimiter(1000), limiter.NewQPSLimiter(interval, 10000), nil, false),
-				bound.NewTransMetaHandler([]remote.MetaHandler{noopMetahandler{}, transmeta.MetainfoServerHandler}),
 			},
 			wantOutbounds: []remote.OutboundHandler{
-				bound.NewTransMetaHandler([]remote.MetaHandler{noopMetahandler{}, transmeta.MetainfoServerHandler}),
+				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler, noopMetahandler{}}),
 			},
 		},
 		{
@@ -386,8 +611,8 @@ func TestServerBoundHandler(t *testing.T) {
 				WithConnectionLimiter(mockslimiter.NewMockConcurrencyLimiter(ctrl)),
 			},
 			wantInbounds: []remote.InboundHandler{
+				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
 				bound.NewServerLimiterHandler(mockslimiter.NewMockConcurrencyLimiter(ctrl), &limiter.DummyRateLimiter{}, nil, false),
-				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
 			},
 			wantOutbounds: []remote.OutboundHandler{
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
@@ -398,8 +623,8 @@ func TestServerBoundHandler(t *testing.T) {
 				WithQPSLimiter(mockslimiter.NewMockRateLimiter(ctrl)),
 			},
 			wantInbounds: []remote.InboundHandler{
+				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
 				bound.NewServerLimiterHandler(&limiter.DummyConcurrencyLimiter{}, mockslimiter.NewMockRateLimiter(ctrl), nil, true),
-				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
 			},
 			wantOutbounds: []remote.OutboundHandler{
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
@@ -411,8 +636,8 @@ func TestServerBoundHandler(t *testing.T) {
 				WithQPSLimiter(mockslimiter.NewMockRateLimiter(ctrl)),
 			},
 			wantInbounds: []remote.InboundHandler{
-				bound.NewServerLimiterHandler(mockslimiter.NewMockConcurrencyLimiter(ctrl), mockslimiter.NewMockRateLimiter(ctrl), nil, true),
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
+				bound.NewServerLimiterHandler(mockslimiter.NewMockConcurrencyLimiter(ctrl), mockslimiter.NewMockRateLimiter(ctrl), nil, true),
 			},
 			wantOutbounds: []remote.OutboundHandler{
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
@@ -427,8 +652,8 @@ func TestServerBoundHandler(t *testing.T) {
 				WithConnectionLimiter(mockslimiter.NewMockConcurrencyLimiter(ctrl)),
 			},
 			wantInbounds: []remote.InboundHandler{
+				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
 				bound.NewServerLimiterHandler(mockslimiter.NewMockConcurrencyLimiter(ctrl), limiter.NewQPSLimiter(interval, 10000), nil, false),
-				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
 			},
 			wantOutbounds: []remote.OutboundHandler{
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
@@ -444,8 +669,8 @@ func TestServerBoundHandler(t *testing.T) {
 				WithQPSLimiter(mockslimiter.NewMockRateLimiter(ctrl)),
 			},
 			wantInbounds: []remote.InboundHandler{
-				bound.NewServerLimiterHandler(mockslimiter.NewMockConcurrencyLimiter(ctrl), mockslimiter.NewMockRateLimiter(ctrl), nil, true),
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
+				bound.NewServerLimiterHandler(mockslimiter.NewMockConcurrencyLimiter(ctrl), mockslimiter.NewMockRateLimiter(ctrl), nil, true),
 			},
 			wantOutbounds: []remote.OutboundHandler{
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
@@ -462,8 +687,8 @@ func TestServerBoundHandler(t *testing.T) {
 				WithMuxTransport(),
 			},
 			wantInbounds: []remote.InboundHandler{
-				bound.NewServerLimiterHandler(mockslimiter.NewMockConcurrencyLimiter(ctrl), mockslimiter.NewMockRateLimiter(ctrl), nil, true),
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
+				bound.NewServerLimiterHandler(mockslimiter.NewMockConcurrencyLimiter(ctrl), mockslimiter.NewMockRateLimiter(ctrl), nil, true),
 			},
 			wantOutbounds: []remote.OutboundHandler{
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
@@ -478,8 +703,8 @@ func TestServerBoundHandler(t *testing.T) {
 				WithMuxTransport(),
 			},
 			wantInbounds: []remote.InboundHandler{
+				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
 				bound.NewServerLimiterHandler(limiter.NewConnectionLimiter(1000), limiter.NewQPSLimiter(interval, 10000), nil, true),
-				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
 			},
 			wantOutbounds: []remote.OutboundHandler{
 				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler}),
@@ -490,30 +715,140 @@ func TestServerBoundHandler(t *testing.T) {
 				WithMetaHandler(noopMetahandler{}),
 			},
 			wantInbounds: []remote.InboundHandler{
-				bound.NewTransMetaHandler([]remote.MetaHandler{noopMetahandler{}, transmeta.MetainfoServerHandler}),
+				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler, noopMetahandler{}}),
 			},
 			wantOutbounds: []remote.OutboundHandler{
-				bound.NewTransMetaHandler([]remote.MetaHandler{noopMetahandler{}, transmeta.MetainfoServerHandler}),
+				bound.NewTransMetaHandler([]remote.MetaHandler{transmeta.MetainfoServerHandler, noopMetahandler{}}),
 			},
 		},
 	}
 	for _, tcase := range cases {
-		svr := NewServer(tcase.opts...)
-
-		time.AfterFunc(100*time.Millisecond, func() {
-			err := svr.Stop()
-			test.Assert(t, err == nil, err)
-		})
+		opts := append(tcase.opts, WithExitWaitTime(time.Millisecond*10))
+		svr, _ := NewTestServer(opts...)
 		err := svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
 		test.Assert(t, err == nil)
+
+		goWaitAndStop(t, svr)
 		err = svr.Run()
 		test.Assert(t, err == nil, err)
 
+		// may have data race issue. make sure will NOT have any connection in this case.
+		// Read: DeepEqual
+		// Write: OnActive/OnInactive
 		iSvr := svr.(*server)
 		test.Assert(t, inboundDeepEqual(iSvr.opt.RemoteOpt.Inbounds, tcase.wantInbounds))
 		test.Assert(t, reflect.DeepEqual(iSvr.opt.RemoteOpt.Outbounds, tcase.wantOutbounds))
-		svr.Stop()
 	}
+}
+
+func TestInvokeHandlerWithContextBackup(t *testing.T) {
+	testInvokeHandlerWithSession(t, true, "localhost:0")
+	os.Setenv(localsession.SESSION_CONFIG_KEY, "true,100,1h")
+	testInvokeHandlerWithSession(t, false, "localhost:0")
+}
+
+func testInvokeHandlerWithSession(t *testing.T, fail bool, ad string) {
+	callMethod := "mock"
+	var opts []Option
+	mwExec := false
+	opts = append(opts, WithMiddleware(func(next endpoint.Endpoint) endpoint.Endpoint {
+		return func(ctx context.Context, req, resp interface{}) (err error) {
+			mwExec = true
+			return next(ctx, req, resp)
+		}
+	}))
+
+	k1, v1 := "1", "1"
+	var backupHandler backup.BackupHandler
+	if !fail {
+		opts = append(opts, WithContextBackup(true, true))
+		backupHandler = func(prev, cur context.Context) (context.Context, bool) {
+			v := prev.Value(k1)
+			if v != nil {
+				cur = context.WithValue(cur, k1, v)
+				return cur, true
+			}
+			return cur, true
+		}
+	}
+
+	opts = append(opts, WithCodec(&mockCodec{}))
+	transHdlrFact := &mockSvrTransHandlerFactory{}
+	exitCh := make(chan bool)
+	var ln net.Listener
+	transSvr := &mocks.MockTransServer{
+		BootstrapServerFunc: func(net.Listener) error {
+			{ // mock server call
+				ri := rpcinfo.NewRPCInfo(nil, nil, rpcinfo.NewInvocation(svcInfo.ServiceName, callMethod), nil, rpcinfo.NewRPCStats())
+				ctx := rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
+				svcSearcher := newServices()
+				svcSearcher.addService(svcInfo, mocks.MyServiceHandler(), &RegisterOptions{})
+				recvMsg := remote.NewMessageWithNewer(svcInfo, svcSearcher, ri, remote.Call, remote.Server)
+				recvMsg.NewData(callMethod)
+				sendMsg := remote.NewMessage(svcInfo.MethodInfo(callMethod).NewResult(), svcInfo, ri, remote.Reply, remote.Server)
+
+				// inject kvs here
+				ctx = metainfo.WithPersistentValue(ctx, "a", "b")
+				ctx = context.WithValue(ctx, k1, v1)
+
+				_, err := transHdlrFact.hdlr.OnMessage(ctx, recvMsg, sendMsg)
+				test.Assert(t, err == nil, err)
+			}
+			<-exitCh
+			return nil
+		},
+		ShutdownFunc: func() error {
+			if ln != nil {
+				ln.Close()
+			}
+			exitCh <- true
+			return nil
+		},
+		CreateListenerFunc: func(addr net.Addr) (net.Listener, error) {
+			var err error
+			ln, err = net.Listen("tcp", ad)
+			return ln, err
+		},
+	}
+	opts = append(opts, WithTransServerFactory(mocks.NewMockTransServerFactory(transSvr)))
+	opts = append(opts, WithTransHandlerFactory(transHdlrFact))
+
+	svr := NewServer(opts...)
+	time.AfterFunc(100*time.Millisecond, func() {
+		err := svr.Stop()
+		test.Assert(t, err == nil, err)
+	})
+	serviceHandler := false
+	err := svr.RegisterService(mocks.ServiceInfo(), mocks.MockFuncHandler(func(ctx context.Context, req *mocks.MyRequest) (r *mocks.MyResponse, err error) {
+		serviceHandler = true
+
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// miss context here
+			ctx := backup.RecoverCtxOnDemands(context.Background(), backupHandler)
+
+			if !fail {
+				b, _ := metainfo.GetPersistentValue(ctx, "a")
+				test.Assert(t, b == "b", "can't get metainfo")
+				test.Assert(t, ctx.Value(k1) == v1, "can't get v1")
+			} else {
+				_, ok := metainfo.GetPersistentValue(ctx, "a")
+				test.Assert(t, !ok, "can get metainfo")
+				test.Assert(t, ctx.Value(k1) != v1, "can get v1")
+			}
+		}()
+		wg.Wait()
+
+		return &mocks.MyResponse{Name: "mock"}, nil
+	}))
+	test.Assert(t, err == nil)
+	err = svr.Run()
+	test.Assert(t, err == nil, err)
+	test.Assert(t, mwExec)
+	test.Assert(t, serviceHandler)
 }
 
 func TestInvokeHandlerExec(t *testing.T) {
@@ -528,7 +863,6 @@ func TestInvokeHandlerExec(t *testing.T) {
 	}))
 	opts = append(opts, WithCodec(&mockCodec{}))
 	transHdlrFact := &mockSvrTransHandlerFactory{}
-	svcInfo := mocks.ServiceInfo()
 	exitCh := make(chan bool)
 	var ln net.Listener
 	transSvr := &mocks.MockTransServer{
@@ -536,7 +870,9 @@ func TestInvokeHandlerExec(t *testing.T) {
 			{ // mock server call
 				ri := rpcinfo.NewRPCInfo(nil, nil, rpcinfo.NewInvocation(svcInfo.ServiceName, callMethod), nil, rpcinfo.NewRPCStats())
 				ctx := rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
-				recvMsg := remote.NewMessageWithNewer(svcInfo, ri, remote.Call, remote.Server)
+				svcSearcher := newServices()
+				svcSearcher.addService(svcInfo, mocks.MyServiceHandler(), &RegisterOptions{})
+				recvMsg := remote.NewMessageWithNewer(svcInfo, svcSearcher, ri, remote.Call, remote.Server)
 				recvMsg.NewData(callMethod)
 				sendMsg := remote.NewMessage(svcInfo.MethodInfo(callMethod).NewResult(), svcInfo, ri, remote.Reply, remote.Server)
 
@@ -555,7 +891,7 @@ func TestInvokeHandlerExec(t *testing.T) {
 		},
 		CreateListenerFunc: func(addr net.Addr) (net.Listener, error) {
 			var err error
-			ln, err = net.Listen("tcp", ":8888")
+			ln, err = net.Listen("tcp", "localhost:0")
 			return ln, err
 		},
 	}
@@ -591,7 +927,6 @@ func TestInvokeHandlerPanic(t *testing.T) {
 	}))
 	opts = append(opts, WithCodec(&mockCodec{}))
 	transHdlrFact := &mockSvrTransHandlerFactory{}
-	svcInfo := mocks.ServiceInfo()
 	exitCh := make(chan bool)
 	var ln net.Listener
 	transSvr := &mocks.MockTransServer{
@@ -600,7 +935,9 @@ func TestInvokeHandlerPanic(t *testing.T) {
 				// mock server call
 				ri := rpcinfo.NewRPCInfo(nil, nil, rpcinfo.NewInvocation(svcInfo.ServiceName, callMethod), nil, rpcinfo.NewRPCStats())
 				ctx := rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
-				recvMsg := remote.NewMessageWithNewer(svcInfo, ri, remote.Call, remote.Server)
+				svcSearcher := newServices()
+				svcSearcher.addService(svcInfo, mocks.MyServiceHandler(), &RegisterOptions{})
+				recvMsg := remote.NewMessageWithNewer(svcInfo, svcSearcher, ri, remote.Call, remote.Server)
 				recvMsg.NewData(callMethod)
 				sendMsg := remote.NewMessage(svcInfo.MethodInfo(callMethod).NewResult(), svcInfo, ri, remote.Reply, remote.Server)
 
@@ -617,7 +954,7 @@ func TestInvokeHandlerPanic(t *testing.T) {
 		},
 		CreateListenerFunc: func(addr net.Addr) (net.Listener, error) {
 			var err error
-			ln, err = net.Listen("tcp", ":8888")
+			ln, err = net.Listen("tcp", "localhost:0")
 			return ln, err
 		},
 	}
@@ -639,6 +976,183 @@ func TestInvokeHandlerPanic(t *testing.T) {
 	test.Assert(t, err == nil, err)
 	test.Assert(t, mwExec)
 	test.Assert(t, serviceHandler)
+}
+
+func TestRegisterService(t *testing.T) {
+	{
+		svr := NewServer()
+		time.AfterFunc(time.Second, func() {
+			err := svr.Stop()
+			test.Assert(t, err == nil, err)
+		})
+
+		svr.Run()
+
+		test.PanicAt(t, func() {
+			_ = svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
+		}, func(err interface{}) bool {
+			if errMsg, ok := err.(string); ok {
+				return strings.Contains(errMsg, "server is running")
+			}
+			return true
+		})
+		svr.Stop()
+	}
+
+	{
+		svr := NewServer()
+		time.AfterFunc(time.Second, func() {
+			err := svr.Stop()
+			test.Assert(t, err == nil, err)
+		})
+
+		test.PanicAt(t, func() {
+			_ = svr.RegisterService(nil, mocks.MyServiceHandler())
+		}, func(err interface{}) bool {
+			if errMsg, ok := err.(string); ok {
+				return strings.Contains(errMsg, "svcInfo is nil")
+			}
+			return true
+		})
+
+		test.PanicAt(t, func() {
+			_ = svr.RegisterService(mocks.ServiceInfo(), nil)
+		}, func(err interface{}) bool {
+			if errMsg, ok := err.(string); ok {
+				return strings.Contains(errMsg, "handler is nil")
+			}
+			return true
+		})
+
+		test.PanicAt(t, func() {
+			_ = svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler(), WithFallbackService())
+			_ = svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
+		}, func(err interface{}) bool {
+			if errMsg, ok := err.(string); ok {
+				return strings.Contains(errMsg, "Service[MockService] is already defined")
+			}
+			return true
+		})
+
+		test.PanicAt(t, func() {
+			_ = svr.RegisterService(mocks.Service2Info(), mocks.MyServiceHandler(), WithFallbackService())
+		}, func(err interface{}) bool {
+			if errMsg, ok := err.(string); ok {
+				return strings.Contains(errMsg, "multiple fallback services cannot be registered")
+			}
+			return true
+		})
+		svr.Stop()
+	}
+
+	{
+		svr := NewServer()
+		time.AfterFunc(time.Second, func() {
+			err := svr.Stop()
+			test.Assert(t, err == nil, err)
+		})
+
+		_ = svr.RegisterService(mocks.ServiceInfo(), mocks.MyServiceHandler())
+		_ = svr.RegisterService(mocks.Service3Info(), mocks.MyServiceHandler())
+		err := svr.Run()
+		test.Assert(t, err != nil)
+		test.Assert(t, err.Error() == "method name [mock] is conflicted between services but no fallback service is specified")
+		svr.Stop()
+	}
+}
+
+func TestRegisterServiceWithMiddleware(t *testing.T) {
+	callMethod := "mock"
+	var opts []Option
+	opts = append(opts, WithCodec(&mockCodec{}))
+	transHdlrFact := &mockSvrTransHandlerFactory{}
+	exitCh := make(chan bool)
+	var ln net.Listener
+	transSvr := &mocks.MockTransServer{
+		BootstrapServerFunc: func(net.Listener) error {
+			{
+				// mock server call
+				ri := rpcinfo.NewRPCInfo(nil, nil, rpcinfo.NewInvocation(svcInfo.ServiceName, callMethod), nil, rpcinfo.NewRPCStats())
+				ctx := rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
+				svcSearcher := newServices()
+				svcSearcher.addService(svcInfo, mocks.MyServiceHandler(), &RegisterOptions{})
+				recvMsg := remote.NewMessageWithNewer(svcInfo, svcSearcher, ri, remote.Call, remote.Server)
+				recvMsg.NewData(callMethod)
+				sendMsg := remote.NewMessage(svcInfo.MethodInfo(callMethod).NewResult(), svcInfo, ri, remote.Reply, remote.Server)
+
+				_, err := transHdlrFact.hdlr.OnMessage(ctx, recvMsg, sendMsg)
+				test.Assert(t, err == nil)
+			}
+			<-exitCh
+			return nil
+		},
+		ShutdownFunc: func() error {
+			ln.Close()
+			exitCh <- true
+			return nil
+		},
+		CreateListenerFunc: func(addr net.Addr) (net.Listener, error) {
+			var err error
+			ln, err = net.Listen("tcp", "localhost:0")
+			return ln, err
+		},
+	}
+	serverMW := 0
+	serviceMW1 := 0
+	serviceMW2 := 0
+	serviceHandler := 0
+	opts = append(opts, WithTransServerFactory(mocks.NewMockTransServerFactory(transSvr)))
+	opts = append(opts, WithTransHandlerFactory(transHdlrFact))
+	// server middleware
+	opts = append(opts, WithMiddleware(func(next endpoint.Endpoint) endpoint.Endpoint {
+		return func(ctx context.Context, req, resp interface{}) (err error) {
+			test.Assert(t, serverMW == 0 && serviceMW1 == 0 && serviceMW2 == 0 && serviceHandler == 0)
+			serverMW++
+			err = next(ctx, req, resp)
+			test.Assert(t, serverMW == 1 && serviceMW1 == 2 && serviceMW2 == 2 && serviceHandler == 2)
+			serverMW++
+			return err
+		}
+	}))
+	svr := NewServer(opts...)
+	time.AfterFunc(100*time.Millisecond, func() {
+		err := svr.Stop()
+		test.Assert(t, err == nil, err)
+	})
+	err := svr.RegisterService(
+		mocks.ServiceInfo(),
+		mocks.MockFuncHandler(func(ctx context.Context, req *mocks.MyRequest) (r *mocks.MyResponse, err error) {
+			test.Assert(t, serverMW == 1 && serviceMW1 == 1 && serviceMW2 == 1 && serviceHandler == 0)
+			serviceHandler += 2
+			return &mocks.MyResponse{}, nil
+		}),
+		// service middleware 1
+		WithServiceMiddleware(func(next endpoint.Endpoint) endpoint.Endpoint {
+			return func(ctx context.Context, req, resp interface{}) (err error) {
+				test.Assert(t, serverMW == 1 && serviceMW1 == 0 && serviceMW2 == 0 && serviceHandler == 0)
+				serviceMW1++
+				err = next(ctx, req, resp)
+				test.Assert(t, serverMW == 1 && serviceMW1 == 1 && serviceMW2 == 2 && serviceHandler == 2)
+				serviceMW1++
+				return err
+			}
+		}),
+		// service middleware 2
+		WithServiceMiddleware(func(next endpoint.Endpoint) endpoint.Endpoint {
+			return func(ctx context.Context, req, resp interface{}) (err error) {
+				test.Assert(t, serverMW == 1 && serviceMW1 == 1 && serviceMW2 == 0 && serviceHandler == 0)
+				serviceMW2++
+				err = next(ctx, req, resp)
+				test.Assert(t, serverMW == 1 && serviceMW1 == 1 && serviceMW2 == 1 && serviceHandler == 2)
+				serviceMW2++
+				return err
+			}
+		}),
+	)
+	test.Assert(t, err == nil)
+	err = svr.Run()
+	test.Assert(t, err == nil, err)
+	test.Assert(t, serverMW == 2 && serviceMW1 == 2 && serviceMW2 == 2 && serviceHandler == 2)
 }
 
 type noopMetahandler struct{}
@@ -711,9 +1225,11 @@ func (m *mockCodec) Decode(ctx context.Context, msg remote.Message, in remote.By
 }
 
 func TestDuplicatedRegisterInfoPanic(t *testing.T) {
+	svcs := newServices()
+	svcs.addService(mocks.ServiceInfo(), nil, &RegisterOptions{})
 	s := &server{
-		svcInfo: mocks.ServiceInfo(),
-		opt:     internal_server.NewOptions(nil),
+		opt:  internal_server.NewOptions(nil),
+		svcs: svcs,
 	}
 	s.init()
 
@@ -742,4 +1258,117 @@ func inboundDeepEqual(inbound1, inbound2 []remote.InboundHandler) bool {
 		}
 	}
 	return true
+}
+
+func withGRPCTransport() Option {
+	return Option{F: func(o *internal_server.Options, di *utils.Slice) {
+		o.RemoteOpt.SvrHandlerFactory = nphttp2.NewSvrTransHandlerFactory()
+	}}
+}
+
+type mockStream struct {
+	streaming.Stream
+	ctx context.Context
+}
+
+func (s *mockStream) Context() context.Context {
+	return s.ctx
+}
+
+type streamingMethodArg struct {
+	methodName string
+	mode       serviceinfo.StreamingMode
+	streamHdlr serviceinfo.MethodHandler
+}
+
+func newStreamingServer(svcName string, args []streamingMethodArg, mws []endpoint.Middleware) *server {
+	methods := make(map[string]serviceinfo.MethodInfo)
+	for _, arg := range args {
+		methods[arg.methodName] = serviceinfo.NewMethodInfo(arg.streamHdlr, nil, nil, false, serviceinfo.WithStreamingMode(arg.mode))
+	}
+	svcInfo := &serviceinfo.ServiceInfo{
+		ServiceName: svcName,
+		Methods:     methods,
+	}
+	svr := &server{
+		svcs: &services{
+			svcMap: map[string]*service{
+				svcName: {
+					svcInfo:            svcInfo,
+					serviceMiddlewares: serviceMiddlewares{MW: endpoint.Chain(mws...)},
+				},
+			},
+		},
+		opt: internal_server.NewOptions(nil),
+	}
+	return svr
+}
+
+func TestStreamCtxDiverge(t *testing.T) {
+	testcases := []struct {
+		methodName string
+		mode       serviceinfo.StreamingMode
+	}{
+		{
+			methodName: "ClientStreaming",
+			mode:       serviceinfo.StreamingClient,
+		},
+		{
+			methodName: "ServerStreaming",
+			mode:       serviceinfo.StreamingServer,
+		},
+		{
+			methodName: "BidiStreaming",
+			mode:       serviceinfo.StreamingBidirectional,
+		},
+	}
+
+	testKey := "key"
+	testVal := "val"
+	testService := "test"
+	streamHdlr := func(ctx context.Context, handler, arg, result interface{}) error {
+		st, ok := arg.(*streaming.Args)
+		test.Assert(t, ok)
+		val, ok := st.Stream.Context().Value(testKey).(string)
+		test.Assert(t, ok)
+		test.Assert(t, val == testVal)
+		return nil
+	}
+
+	var args []streamingMethodArg
+	for _, tc := range testcases {
+		args = append(args, streamingMethodArg{
+			methodName: tc.methodName,
+			mode:       tc.mode,
+			streamHdlr: streamHdlr,
+		})
+	}
+	mws := []endpoint.Middleware{
+		// treat it as user middleware
+		// user would modify the ctx here
+		func(next endpoint.Endpoint) endpoint.Endpoint {
+			return func(ctx context.Context, req, resp interface{}) (err error) {
+				ctx = context.WithValue(ctx, testKey, testVal)
+				return next(ctx, req, resp)
+			}
+		},
+	}
+	svr := newStreamingServer(testService, args, mws)
+	svr.buildInvokeChain(context.Background())
+
+	for _, tc := range testcases {
+		t.Run(tc.methodName, func(t *testing.T) {
+			ri := svr.initOrResetRPCInfoFunc()(nil, nil)
+			ink, ok := ri.Invocation().(rpcinfo.InvocationSetter)
+			test.Assert(t, ok)
+			ink.SetServiceName(testService)
+			ink.SetMethodName(tc.methodName)
+			ctx := rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
+			mock := &mockStream{
+				ctx: ctx,
+			}
+			err := svr.eps(ctx, &streaming.Args{Stream: mock}, nil)
+			test.Assert(t, err == nil, err)
+		})
+	}
 }

@@ -18,10 +18,13 @@
 package client
 
 import (
+	"context"
 	"time"
 
+	"github.com/cloudwego/localsession/backup"
+
 	"github.com/cloudwego/kitex/internal/configutil"
-	internal_stats "github.com/cloudwego/kitex/internal/stats"
+	"github.com/cloudwego/kitex/internal/stream"
 	"github.com/cloudwego/kitex/pkg/acl"
 	"github.com/cloudwego/kitex/pkg/circuitbreak"
 	connpool2 "github.com/cloudwego/kitex/pkg/connpool"
@@ -29,6 +32,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/discovery"
 	"github.com/cloudwego/kitex/pkg/endpoint"
 	"github.com/cloudwego/kitex/pkg/event"
+	"github.com/cloudwego/kitex/pkg/fallback"
 	"github.com/cloudwego/kitex/pkg/http"
 	"github.com/cloudwego/kitex/pkg/loadbalance"
 	"github.com/cloudwego/kitex/pkg/loadbalance/lbcache"
@@ -43,6 +47,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
+	"github.com/cloudwego/kitex/pkg/streamx"
 	"github.com/cloudwego/kitex/pkg/transmeta"
 	"github.com/cloudwego/kitex/pkg/utils"
 	"github.com/cloudwego/kitex/pkg/warmup"
@@ -71,7 +76,7 @@ type Options struct {
 	Balancer         loadbalance.Loadbalancer
 	BalancerCacheOpt *lbcache.Options
 	PoolCfg          *connpool2.IdleConfig
-	ErrHandle        func(error) error
+	ErrHandle        func(context.Context, error) error
 	Targets          string
 	CBSuite          *circuitbreak.CBSuite
 	Timeouts         rpcinfo.TimeoutProvider
@@ -85,18 +90,21 @@ type Options struct {
 	Events       event.Queue
 	ExtraTimeout time.Duration
 
-	// DebugInfo should only contains objects that are suitable for json serialization.
+	// DebugInfo should only contain objects that are suitable for json serialization.
 	DebugInfo    utils.Slice
 	DebugService diagnosis.Service
 
 	// Observability
-	TracerCtl  *internal_stats.Controller
+	TracerCtl  *rpcinfo.TraceController
 	StatsLevel *stats.Level
 
 	// retry policy
 	RetryMethodPolicies map[string]retry.Policy
 	RetryContainer      *retry.Container
 	RetryWithResult     *retry.ShouldResultRetry
+
+	// fallback policy
+	Fallback *fallback.Policy
 
 	CloseCallbacks []func() error
 	WarmUpOption   *warmup.ClientOption
@@ -108,6 +116,12 @@ type Options struct {
 	// XDS
 	XDSEnabled          bool
 	XDSRouterMiddleware endpoint.Middleware
+
+	// Context backup
+	CtxBackupHandler backup.BackupHandler
+
+	Streaming stream.StreamingConfig
+	StreamX   StreamXOptions
 }
 
 // Apply applies all options.
@@ -127,6 +141,7 @@ func NewOptions(opts []Option) *Options {
 	o := &Options{
 		Cli:          &rpcinfo.EndpointBasicInfo{Tags: make(map[string]string)},
 		Svr:          &rpcinfo.EndpointBasicInfo{Tags: make(map[string]string)},
+		MetaHandlers: []remote.MetaHandler{transmeta.MetainfoClientHandler},
 		RemoteOpt:    newClientRemoteOption(),
 		Configs:      rpcinfo.NewRPCConfig(),
 		Locks:        NewConfigLocks(),
@@ -137,12 +152,11 @@ func NewOptions(opts []Option) *Options {
 		Bus:    event.NewEventBus(),
 		Events: event.NewQueue(event.MaxEventNum),
 
-		TracerCtl: &internal_stats.Controller{},
+		TracerCtl: &rpcinfo.TraceController{},
 
 		GRPCConnectOpts: new(grpc.ConnectOptions),
 	}
 	o.Apply(opts)
-	o.MetaHandlers = append(o.MetaHandlers, transmeta.MetainfoClientHandler)
 
 	o.initRemoteOpt()
 
@@ -189,4 +203,20 @@ func (o *Options) initRemoteOpt() {
 			)
 		}
 	}
+}
+
+// InitRetryContainer init retry container and add close callback
+func (o *Options) InitRetryContainer() {
+	if o.RetryContainer == nil {
+		o.RetryContainer = retry.NewRetryContainerWithPercentageLimit()
+		o.CloseCallbacks = append(o.CloseCallbacks, o.RetryContainer.Close)
+	}
+}
+
+// StreamXOptions define the client options
+type StreamXOptions struct {
+	RecvTimeout   time.Duration
+	StreamMWs     []streamx.StreamMiddleware
+	StreamRecvMWs []streamx.StreamRecvMiddleware
+	StreamSendMWs []streamx.StreamSendMiddleware
 }

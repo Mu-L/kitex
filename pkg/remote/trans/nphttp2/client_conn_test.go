@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/cloudwego/kitex/internal/test"
+	"github.com/cloudwego/kitex/pkg/rpcinfo"
 )
 
 func TestClientConn(t *testing.T) {
@@ -60,29 +61,38 @@ func TestClientConn(t *testing.T) {
 	test.Assert(t, n == 0)
 }
 
-//func TestClientConnRead(t *testing.T) {
-//	mockey.PatchConvey("TestClientConnRead", t, func() {
-//		mockey.Mock((*grpc.Stream).Read).Return(1, io.EOF).Build()
-//		mockey.Mock((*grpc.Stream).Status).Return(status.New(codes.Internal, "not found")).Build()
-//		mockey.Mock((*grpc.Stream).BizStatusErr).Return(kerrors.NewGRPCBizStatusError(404, "not found")).Build()
-//		s := &grpc.Stream{}
-//		cli := &clientConn{s: s}
-//		n, err := cli.Read(nil)
-//		test.Assert(t, n == 1)
-//		bizErr, _ := kerrors.FromBizStatusError(err)
-//		test.Assert(t, bizErr.BizStatusCode() == 404)
-//		test.Assert(t, bizErr.BizMessage() == "not found")
-//	})
-//	mockey.PatchConvey("TestClientConnRead", t, func() {
-//		mockey.Mock((*grpc.Stream).Read).Return(1, io.EOF).Build()
-//		mockey.Mock((*grpc.Stream).Status).Return(status.New(codes.Internal, "not found")).Build()
-//		mockey.Mock((*grpc.Stream).BizStatusErr).Return(nil).Build()
-//		s := &grpc.Stream{}
-//		cli := &clientConn{s: s}
-//		n, err := cli.Read(nil)
-//		test.Assert(t, err != nil)
-//		_, isBizErr := kerrors.FromBizStatusError(err)
-//		test.Assert(t, !isBizErr)
-//		test.Assert(t, n == 1)
-//	})
-//}
+func TestClientConnStreamDesc(t *testing.T) {
+	connPool := newMockConnPool()
+
+	// streaming
+	ctx := newMockCtxWithRPCInfo()
+	ri := rpcinfo.GetRPCInfo(ctx)
+	test.Assert(t, ri != nil)
+	rpcinfo.AsMutableRPCConfig(ri.Config()).SetInteractionMode(rpcinfo.Streaming)
+	conn, err := connPool.Get(ctx, "tcp", mockAddr0, newMockConnOption())
+	test.Assert(t, err == nil, err)
+	defer conn.Close()
+	cn := conn.(*clientConn)
+	test.Assert(t, cn != nil)
+	test.Assert(t, cn.desc.isStreaming == true)
+
+	// pingpong
+	rpcinfo.AsMutableRPCConfig(ri.Config()).SetInteractionMode(rpcinfo.PingPong)
+	conn, err = connPool.Get(ctx, "tcp", mockAddr0, newMockConnOption())
+	test.Assert(t, err == nil, err)
+	defer conn.Close()
+	cn = conn.(*clientConn)
+	test.Assert(t, cn != nil)
+	test.Assert(t, cn.desc.isStreaming == false)
+}
+
+func Test_fullMethodName(t *testing.T) {
+	t.Run("empty pkg", func(t *testing.T) {
+		got := fullMethodName("", "svc", "method")
+		test.Assert(t, got == "/svc/method")
+	})
+	t.Run("with pkg", func(t *testing.T) {
+		got := fullMethodName("pkg", "svc", "method")
+		test.Assert(t, got == "/pkg.svc/method")
+	})
+}

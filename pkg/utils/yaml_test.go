@@ -18,15 +18,17 @@ package utils
 
 import (
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/cloudwego/kitex/internal/test"
 )
 
-const (
-	TestYamlFile = "/tmp/test.yaml"
-)
+func getTestYamlFile(t *testing.T) string {
+	return filepath.Join(t.TempDir(), "test.yaml")
+}
 
 var cfg *YamlConfig
 
@@ -77,29 +79,26 @@ MockFloat64: 123456.789`
 	}
 }
 
-func deleteTestYamlFile(t *testing.T, path string) {
-	if err := os.Remove(path); err != nil {
-		t.Errorf("Remove file: %s error, err: %s", path, err.Error())
+func TestMain(m *testing.M) {
+	if runtime.GOOS == "windows" {
+		return
 	}
-}
-
-func init() {
 	t := &testing.T{}
-	createTestYamlFile(t, TestYamlFile)
-	defer func() {
-		deleteTestYamlFile(t, TestYamlFile)
-	}()
 
-	cfg, _ = ReadYamlConfigFile(TestYamlFile)
+	testYamlFile := getTestYamlFile(t)
+
+	createTestYamlFile(t, testYamlFile)
+
+	cfg, _ = ReadYamlConfigFile(testYamlFile)
+
+	os.Exit(m.Run())
 }
 
 func Test_ReadYamlConfigFile(t *testing.T) {
-	createTestYamlFile(t, TestYamlFile)
-	defer func() {
-		deleteTestYamlFile(t, TestYamlFile)
-	}()
+	testYamlFile := getTestYamlFile(t)
+	createTestYamlFile(t, testYamlFile)
 
-	cfg, err := ReadYamlConfigFile(TestYamlFile)
+	cfg, err := ReadYamlConfigFile(testYamlFile)
 	test.Assert(t, err == nil)
 	addr, ok := cfg.GetString("Address")
 	test.Assert(t, ok && addr == ":8888")

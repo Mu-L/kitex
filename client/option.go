@@ -20,15 +20,16 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/cloudwego/kitex/internal/client"
-	internal_stats "github.com/cloudwego/kitex/internal/stats"
 	"github.com/cloudwego/kitex/pkg/circuitbreak"
 	"github.com/cloudwego/kitex/pkg/connpool"
 	"github.com/cloudwego/kitex/pkg/discovery"
 	"github.com/cloudwego/kitex/pkg/endpoint"
+	"github.com/cloudwego/kitex/pkg/fallback"
 	"github.com/cloudwego/kitex/pkg/http"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/loadbalance"
@@ -276,7 +277,7 @@ func WithTracer(c stats.Tracer) Option {
 		di.Push(fmt.Sprintf("WithTracer(%T{%+v})", c, c))
 
 		if o.TracerCtl == nil {
-			o.TracerCtl = &internal_stats.Controller{}
+			o.TracerCtl = &rpcinfo.TraceController{}
 		}
 		o.TracerCtl.Append(c)
 	}}
@@ -324,12 +325,13 @@ func WithFailureRetry(p *retry.FailurePolicy) Option {
 		if p == nil {
 			return
 		}
-		di.Push(fmt.Sprintf("WithFailureRetry(%+v)", *p))
+		di.Push(fmt.Sprintf("WithFailureRetry(%+v)", p))
 		if o.RetryMethodPolicies == nil {
 			o.RetryMethodPolicies = make(map[string]retry.Policy)
 		}
-		if o.RetryMethodPolicies[retry.Wildcard].BackupPolicy != nil {
-			panic("BackupPolicy has been setup, cannot support Failure Retry at same time")
+		if o.RetryMethodPolicies[retry.Wildcard].MixedPolicy != nil ||
+			o.RetryMethodPolicies[retry.Wildcard].BackupPolicy != nil {
+			panic("MixedPolicy or BackupPolicy has been setup, cannot support Failure Retry at same time")
 		}
 		o.RetryMethodPolicies[retry.Wildcard] = retry.BuildFailurePolicy(p)
 	}}
@@ -341,14 +343,30 @@ func WithBackupRequest(p *retry.BackupPolicy) Option {
 		if p == nil {
 			return
 		}
-		di.Push(fmt.Sprintf("WithBackupRequest(%+v)", *p))
+		di.Push(fmt.Sprintf("WithBackupRequest(%+v)", p))
 		if o.RetryMethodPolicies == nil {
 			o.RetryMethodPolicies = make(map[string]retry.Policy)
 		}
-		if o.RetryMethodPolicies[retry.Wildcard].FailurePolicy != nil {
-			panic("BackupPolicy has been setup, cannot support Failure Retry at same time")
+		if o.RetryMethodPolicies[retry.Wildcard].MixedPolicy != nil ||
+			o.RetryMethodPolicies[retry.Wildcard].FailurePolicy != nil {
+			panic("MixedPolicy or BackupPolicy has been setup, cannot support Failure Retry at same time")
 		}
 		o.RetryMethodPolicies[retry.Wildcard] = retry.BuildBackupRequest(p)
+	}}
+}
+
+// WithMixedRetry sets the mixed retry policy for client, it will take effect for all methods.
+func WithMixedRetry(p *retry.MixedPolicy) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		if p == nil {
+			return
+		}
+		di.Push(fmt.Sprintf("WithMixedRetry(%+v)", p))
+		if o.RetryMethodPolicies == nil {
+			o.RetryMethodPolicies = make(map[string]retry.Policy)
+		}
+		// no need to check if BackupPolicy or FailurePolicy are been setup, just let mixed retry replace it
+		o.RetryMethodPolicies[retry.Wildcard] = retry.BuildMixedPolicy(p)
 	}}
 }
 
@@ -381,11 +399,30 @@ func WithRetryMethodPolicies(mp map[string]retry.Policy) Option {
 // But if your retry policy is enabled by remote config, WithSpecifiedResultRetry is useful.
 func WithSpecifiedResultRetry(rr *retry.ShouldResultRetry) Option {
 	return Option{F: func(o *client.Options, di *utils.Slice) {
-		if rr == nil {
-			return
+		if rr == nil || !rr.IsValid() {
+			panic(fmt.Errorf("WithSpecifiedResultRetry: invalid '%+v'", rr))
 		}
 		di.Push(fmt.Sprintf("WithSpecifiedResultRetry(%+v)", rr))
 		o.RetryWithResult = rr
+	}}
+}
+
+// WithFallback is used to set the fallback policy for the client.
+// Demos are provided below:
+//
+//	demo1. fallback for error and resp
+//		`client.WithFallback(fallback.NewFallbackPolicy(yourFBFunc))`
+//	demo2. fallback for error and enable reportAsFallback, which sets reportAsFallback to be true and will do report(metric) as Fallback result
+//		`client.WithFallback(fallback.ErrorFallback(yourErrFBFunc).EnableReportAsFallback())`
+//	demo2. fallback for rpctime and circuit breaker
+//		`client.WithFallback(fallback.TimeoutAndCBFallback(yourErrFBFunc))`
+func WithFallback(fb *fallback.Policy) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		if !fallback.IsPolicyValid(fb) {
+			panic(fmt.Errorf("WithFallback: invalid '%+v'", fb))
+		}
+		di.Push(fmt.Sprintf("WithFallback(%+v)", fb))
+		o.Fallback = fb
 	}}
 }
 
@@ -494,5 +531,15 @@ func WithXDSSuite(suite xds.ClientSuite) Option {
 			o.XDSRouterMiddleware = suite.RouterMiddleware
 			o.Resolver = suite.Resolver
 		}
+	}}
+}
+
+// WithContextBackup enables local-session to retrieve context backuped by server,
+// in case of user don't correctly pass context into next RPC call.
+//   - backupHandler pass a handler to check and handler user-defined key-values according to current context, returning backup==false means no need further operations.
+func WithContextBackup(backupHandler func(prev, cur context.Context) (ctx context.Context, backup bool)) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithContextBackup({%v})", reflect.TypeOf(backupHandler).String()))
+		o.CtxBackupHandler = backupHandler
 	}}
 }

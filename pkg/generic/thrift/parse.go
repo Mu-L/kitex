@@ -17,13 +17,19 @@
 package thrift
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 
+	"github.com/cloudwego/thriftgo/generator/golang/streaming"
 	"github.com/cloudwego/thriftgo/parser"
 	"github.com/cloudwego/thriftgo/semantic"
 
 	"github.com/cloudwego/kitex/pkg/generic/descriptor"
+	"github.com/cloudwego/kitex/pkg/gofunc"
+	"github.com/cloudwego/kitex/pkg/klog"
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
 const (
@@ -58,7 +64,7 @@ func SetDefaultParseMode(m ParseMode) {
 }
 
 // Parse descriptor from parser.Thrift
-func Parse(tree *parser.Thrift, mode ParseMode) (*descriptor.ServiceDescriptor, error) {
+func Parse(tree *parser.Thrift, mode ParseMode, opts ...ParseOption) (*descriptor.ServiceDescriptor, error) {
 	if len(tree.Services) == 0 {
 		return nil, errors.New("empty serverce from idls")
 	}
@@ -71,31 +77,56 @@ func Parse(tree *parser.Thrift, mode ParseMode) (*descriptor.ServiceDescriptor, 
 		Router:    descriptor.NewRouter(),
 	}
 
-	structsCache := map[string]*descriptor.TypeDescriptor{}
+	pOpts := &parseOptions{}
+	pOpts.apply(opts)
 
 	// support one service
 	svcs := tree.Services
-	switch mode {
-	case LastServiceOnly:
-		svcs = svcs[len(svcs)-1:]
-		sDsc.Name = svcs[len(svcs)-1].Name
-	case FirstServiceOnly:
-		svcs = svcs[:1]
-		sDsc.Name = svcs[0].Name
-	case CombineServices:
-		sDsc.Name = "CombinedServices"
+
+	// if an idl service name is specified, it takes precedence over parse mode
+	if pOpts.serviceName != "" {
+		var err error
+		svcs, err = getTargetService(svcs, pOpts.serviceName)
+		if err != nil {
+			return nil, err
+		}
+		sDsc.Name = pOpts.serviceName
+	} else {
+		switch mode {
+		case LastServiceOnly:
+			svcs = svcs[len(svcs)-1:]
+			sDsc.Name = svcs[len(svcs)-1].Name
+		case FirstServiceOnly:
+			svcs = svcs[:1]
+			sDsc.Name = svcs[0].Name
+		case CombineServices:
+			sDsc.Name = "CombinedServices"
+			sDsc.IsCombinedServices = true
+		}
 	}
 
 	visitedSvcs := make(map[*parser.Service]bool, len(tree.Services))
 	for _, svc := range svcs {
-		for p := range getAllFunctions(svc, tree, visitedSvcs) {
-			fn := p.data.(*parser.Function)
-			if err := addFunction(fn, p.tree, sDsc, structsCache); err != nil {
-				return nil, err
+		for p := range getAllSvcs(svc, tree, visitedSvcs) {
+			svc := p.data.(*parser.Service)
+			structsCache := map[string]*descriptor.TypeDescriptor{}
+			for _, fn := range svc.Functions {
+				if err := addFunction(fn, p.tree, sDsc, structsCache, pOpts); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
 	return sDsc, nil
+}
+
+func getTargetService(svcs []*parser.Service, serviceName string) ([]*parser.Service, error) {
+	for _, svc := range svcs {
+		if svc.Name == serviceName {
+			return []*parser.Service{svc}, nil
+		}
+	}
+	return nil, fmt.Errorf("the idl service name %s is not in the idl. Please check your idl", serviceName)
 }
 
 type pair struct {
@@ -103,8 +134,7 @@ type pair struct {
 	data interface{}
 }
 
-func getAllFunctions(svc *parser.Service, tree *parser.Thrift, visitedSvcs map[*parser.Service]bool) chan *pair {
-	ch := make(chan *pair)
+func getAllSvcs(svc *parser.Service, tree *parser.Thrift, visitedSvcs map[*parser.Service]bool) chan *pair {
 	svcs := make(chan *pair)
 	addSvc := func(tree *parser.Thrift, svc *parser.Service) {
 		if exist := visitedSvcs[svc]; !exist {
@@ -112,7 +142,7 @@ func getAllFunctions(svc *parser.Service, tree *parser.Thrift, visitedSvcs map[*
 			visitedSvcs[svc] = true
 		}
 	}
-	go func() {
+	gofunc.GoFunc(context.Background(), func() {
 		addSvc(tree, svc)
 		for base := svc.Extends; base != ""; base = svc.Extends {
 			ref := svc.GetReference()
@@ -125,100 +155,51 @@ func getAllFunctions(svc *parser.Service, tree *parser.Thrift, visitedSvcs map[*
 			addSvc(tree, svc)
 		}
 		close(svcs)
-	}()
-	go func() {
-		for p := range svcs {
-			svc := p.data.(*parser.Service)
-			for _, fn := range svc.Functions {
-				ch <- &pair{
-					tree: p.tree,
-					data: fn,
-				}
-			}
-		}
-		close(ch)
-	}()
-	return ch
+	})
+	return svcs
 }
 
-func addFunction(fn *parser.Function, tree *parser.Thrift, sDsc *descriptor.ServiceDescriptor, structsCache map[string]*descriptor.TypeDescriptor) error {
+func addFunction(fn *parser.Function, tree *parser.Thrift, sDsc *descriptor.ServiceDescriptor, structsCache map[string]*descriptor.TypeDescriptor, opts *parseOptions) (err error) {
 	if sDsc.Functions[fn.Name] != nil {
 		return fmt.Errorf("duplicate method name: %s", fn.Name)
 	}
 	if len(fn.Arguments) == 0 {
 		return fmt.Errorf("empty arguments in function: %s", fn.Name)
 	}
+	st, err := streaming.ParseStreaming(fn)
+	if err != nil {
+		return err
+	}
+	mode := streamingMode(st)
 	// only support single argument
 	field := fn.Arguments[0]
-	req := &descriptor.TypeDescriptor{
-		Type: descriptor.STRUCT,
-		Struct: &descriptor.StructDescriptor{
-			FieldsByID:   map[int32]*descriptor.FieldDescriptor{},
-			FieldsByName: map[string]*descriptor.FieldDescriptor{},
-		},
-	}
-	reqType, err := parseType(field.Type, tree, structsCache, initRecursionDepth)
-	if err != nil {
-		return err
-	}
-	hasRequestBase := false
-	if reqType.Type == descriptor.STRUCT {
-		for _, f := range reqType.Struct.FieldsByName {
-			if f.Type.IsRequestBase {
-				hasRequestBase = true
-				break
-			}
-		}
-	}
-	reqField := &descriptor.FieldDescriptor{
-		Name: field.Name,
-		ID:   field.ID,
-		Type: reqType,
-	}
-	req.Struct.FieldsByID[field.ID] = reqField
-	req.Struct.FieldsByName[field.Name] = reqField
-	// parse response filed
-	resp := &descriptor.TypeDescriptor{
-		Type: descriptor.STRUCT,
-		Struct: &descriptor.StructDescriptor{
-			FieldsByID:   map[int32]*descriptor.FieldDescriptor{},
-			FieldsByName: map[string]*descriptor.FieldDescriptor{},
-		},
-	}
-	respType, err := parseType(fn.FunctionType, tree, structsCache, initRecursionDepth)
-	if err != nil {
-		return err
-	}
-	respField := &descriptor.FieldDescriptor{
-		Type: respType,
-	}
-	// response has no name or id
-	resp.Struct.FieldsByID[0] = respField
-	resp.Struct.FieldsByName[""] = respField
 
-	if len(fn.Throws) > 0 {
-		// only support single exception
-		field := fn.Throws[0]
-		exceptionType, err := parseType(field.Type, tree, structsCache, initRecursionDepth)
-		if err != nil {
-			return err
-		}
-		exceptionField := &descriptor.FieldDescriptor{
-			Name:        field.Name,
-			ID:          field.ID,
-			IsException: true,
-			Type:        exceptionType,
-		}
-		resp.Struct.FieldsByID[field.ID] = exceptionField
-		resp.Struct.FieldsByName[field.Name] = exceptionField
+	isStream := mode != serviceinfo.StreamingNone && mode != serviceinfo.StreamingUnary
+
+	req, hasRequestBase, err := parseRequest(isStream, field, tree, structsCache, opts)
+	if err != nil {
+		return err
 	}
+	resp, err := parseResponse(isStream, fn, tree, structsCache, opts)
+	if err != nil {
+		return err
+	}
+
 	fnDsc := &descriptor.FunctionDescriptor{
-		Name:           fn.Name,
-		Oneway:         fn.Oneway,
-		Request:        req,
-		Response:       resp,
-		HasRequestBase: hasRequestBase,
+		Name:              fn.Name,
+		Oneway:            fn.Oneway,
+		Request:           req,
+		Response:          resp,
+		HasRequestBase:    hasRequestBase,
+		IsWithoutWrapping: isStream,
+		StreamingMode:     mode,
 	}
+	defer func() {
+		if ret := recover(); ret != nil {
+			klog.Errorf("KITEX: router handle failed, err=%v\nstack=%s", ret, string(debug.Stack()))
+			err = fmt.Errorf("router handle failed, err=%v", ret)
+		}
+	}()
 	for _, ann := range fn.Annotations {
 		for _, v := range ann.GetValues() {
 			if handle, ok := descriptor.FindAnnotation(ann.GetKey(), v); ok {
@@ -231,6 +212,107 @@ func addFunction(fn *parser.Function, tree *parser.Thrift, sDsc *descriptor.Serv
 	}
 	sDsc.Functions[fn.Name] = fnDsc
 	return nil
+}
+
+func streamingMode(st *streaming.Streaming) serviceinfo.StreamingMode {
+	if st.BidirectionalStreaming {
+		return serviceinfo.StreamingBidirectional
+	}
+	if st.ClientStreaming {
+		return serviceinfo.StreamingClient
+	}
+	if st.ServerStreaming {
+		return serviceinfo.StreamingServer
+	}
+	if st.Unary {
+		return serviceinfo.StreamingUnary
+	}
+	return serviceinfo.StreamingNone
+}
+
+func parseRequest(isStream bool, field *parser.Field, tree *parser.Thrift, structsCache map[string]*descriptor.TypeDescriptor, opts *parseOptions) (req *descriptor.TypeDescriptor, hasRequestBase bool, err error) {
+	reqType, err := parseType(field.Type, tree, structsCache, initRecursionDepth, opts)
+	if err != nil {
+		return nil, hasRequestBase, err
+	}
+	if reqType.Type == descriptor.STRUCT {
+		for _, f := range reqType.Struct.FieldsByName {
+			if f.Type.IsRequestBase {
+				hasRequestBase = true
+				break
+			}
+		}
+	}
+
+	if isStream {
+		return reqType, hasRequestBase, nil
+	}
+
+	// wrap with a struct
+	wrappedTyDsc := &descriptor.TypeDescriptor{
+		Type: descriptor.STRUCT,
+		Struct: &descriptor.StructDescriptor{
+			FieldsByID:   map[int32]*descriptor.FieldDescriptor{},
+			FieldsByName: map[string]*descriptor.FieldDescriptor{},
+		},
+	}
+	reqField := &descriptor.FieldDescriptor{
+		Name:     field.Name,
+		ID:       field.ID,
+		Type:     reqType,
+		GoTagOpt: opts.goTag,
+	}
+	wrappedTyDsc.Struct.FieldsByID[field.ID] = reqField
+	wrappedTyDsc.Struct.FieldsByName[field.Name] = reqField
+
+	return wrappedTyDsc, hasRequestBase, nil
+}
+
+func parseResponse(isStream bool, fn *parser.Function, tree *parser.Thrift, structsCache map[string]*descriptor.TypeDescriptor, opts *parseOptions) (*descriptor.TypeDescriptor, error) {
+	respType, err := parseType(fn.FunctionType, tree, structsCache, initRecursionDepth, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if isStream {
+		return respType, nil
+	}
+
+	// wrap with a struct
+	wrappedResp := &descriptor.TypeDescriptor{
+		Type: descriptor.STRUCT,
+		Struct: &descriptor.StructDescriptor{
+			FieldsByID:   map[int32]*descriptor.FieldDescriptor{},
+			FieldsByName: map[string]*descriptor.FieldDescriptor{},
+		},
+	}
+	respField := &descriptor.FieldDescriptor{
+		Type:     respType,
+		GoTagOpt: opts.goTag,
+	}
+	// response has no name or id
+	wrappedResp.Struct.FieldsByID[0] = respField
+	wrappedResp.Struct.FieldsByName[""] = respField
+
+	if len(fn.Throws) > 0 {
+		// only support single exception
+		field := fn.Throws[0]
+		var exceptionType *descriptor.TypeDescriptor
+		exceptionType, err = parseType(field.Type, tree, structsCache, initRecursionDepth, opts)
+		if err != nil {
+			return nil, err
+		}
+		exceptionField := &descriptor.FieldDescriptor{
+			Name:        field.Name,
+			ID:          field.ID,
+			IsException: true,
+			Type:        exceptionType,
+			GoTagOpt:    opts.goTag,
+		}
+		wrappedResp.Struct.FieldsByID[field.ID] = exceptionField
+		wrappedResp.Struct.FieldsByName[field.Name] = exceptionField
+	}
+	return wrappedResp, nil
 }
 
 // reuse builtin types
@@ -250,7 +332,7 @@ var builtinTypes = map[string]*descriptor.TypeDescriptor{
 // arg cache:
 // only support self reference on the same file
 // cross file self reference complicate matters
-func parseType(t *parser.Type, tree *parser.Thrift, cache map[string]*descriptor.TypeDescriptor, recursionDepth int) (*descriptor.TypeDescriptor, error) {
+func parseType(t *parser.Type, tree *parser.Thrift, cache map[string]*descriptor.TypeDescriptor, recursionDepth int, opt *parseOptions) (*descriptor.TypeDescriptor, error) {
 	if ty, ok := builtinTypes[t.Name]; ok {
 		return ty, nil
 	}
@@ -262,20 +344,20 @@ func parseType(t *parser.Type, tree *parser.Thrift, cache map[string]*descriptor
 	case "list":
 		ty := &descriptor.TypeDescriptor{Name: t.Name}
 		ty.Type = descriptor.LIST
-		ty.Elem, err = parseType(t.ValueType, tree, cache, nextRecursionDepth)
+		ty.Elem, err = parseType(t.ValueType, tree, cache, nextRecursionDepth, opt)
 		return ty, err
 	case "set":
 		ty := &descriptor.TypeDescriptor{Name: t.Name}
 		ty.Type = descriptor.SET
-		ty.Elem, err = parseType(t.ValueType, tree, cache, nextRecursionDepth)
+		ty.Elem, err = parseType(t.ValueType, tree, cache, nextRecursionDepth, opt)
 		return ty, err
 	case "map":
 		ty := &descriptor.TypeDescriptor{Name: t.Name}
 		ty.Type = descriptor.MAP
-		if ty.Key, err = parseType(t.KeyType, tree, cache, nextRecursionDepth); err != nil {
+		if ty.Key, err = parseType(t.KeyType, tree, cache, nextRecursionDepth, opt); err != nil {
 			return nil, err
 		}
-		ty.Elem, err = parseType(t.ValueType, tree, cache, nextRecursionDepth)
+		ty.Elem, err = parseType(t.ValueType, tree, cache, nextRecursionDepth, opt)
 		return ty, err
 	default:
 		// check the cache
@@ -293,7 +375,7 @@ func parseType(t *parser.Type, tree *parser.Thrift, cache map[string]*descriptor
 			cache = map[string]*descriptor.TypeDescriptor{}
 		}
 		if typDef, ok := tree.GetTypedef(typeName); ok {
-			return parseType(typDef.Type, tree, cache, nextRecursionDepth)
+			return parseType(typDef.Type, tree, cache, nextRecursionDepth, opt)
 		}
 		if _, ok := tree.GetEnum(typeName); ok {
 			return builtinTypes["i32"], nil
@@ -334,7 +416,9 @@ func parseType(t *parser.Type, tree *parser.Thrift, cache map[string]*descriptor
 				Required: field.Requiredness == parser.FieldType_Required,
 				Optional: field.Requiredness == parser.FieldType_Optional,
 			}
-
+			if opt != nil {
+				_f.GoTagOpt = opt.goTag
+			}
 			for _, ann := range field.Annotations {
 				for _, v := range ann.GetValues() {
 					if handle, ok := descriptor.FindAnnotation(ann.GetKey(), v); ok {
@@ -358,7 +442,7 @@ func parseType(t *parser.Type, tree *parser.Thrift, cache map[string]*descriptor
 			if _f.HTTPMapping == nil {
 				_f.HTTPMapping = descriptor.DefaultNewMapping(_f.FieldName())
 			}
-			if _f.Type, err = parseType(field.Type, tree, cache, nextRecursionDepth); err != nil {
+			if _f.Type, err = parseType(field.Type, tree, cache, nextRecursionDepth, opt); err != nil {
 				return nil, err
 			}
 			// set default value

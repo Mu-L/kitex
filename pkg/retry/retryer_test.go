@@ -18,16 +18,30 @@ package retry
 
 import (
 	"context"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bytedance/sonic"
+
 	"github.com/cloudwego/kitex/internal/test"
+	"github.com/cloudwego/kitex/pkg/circuitbreak"
+	"github.com/cloudwego/kitex/pkg/discovery"
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/rpcinfo/remoteinfo"
+	"github.com/cloudwego/kitex/pkg/stats"
+)
+
+var (
+	remoteTagKey   = "k"
+	remoteTagValue = "v"
+	remoteTags     = map[string]string{remoteTagKey: remoteTagValue}
+	sonici         = sonic.Config{SortMapKeys: true, UseNumber: true}.Froze()
 )
 
 // test new retry container
@@ -38,7 +52,7 @@ func TestNewRetryContainer(t *testing.T) {
 		BackupPolicy:  NewBackupPolicy(10),
 		FailurePolicy: NewFailurePolicy(),
 	})
-	r := rc.getRetryer(genRPCInfo())
+	r := rc.getRetryer(context.Background(), genRPCInfo())
 	_, ok := r.(*failureRetryer)
 	test.Assert(t, ok)
 
@@ -57,7 +71,7 @@ func TestNewRetryContainer(t *testing.T) {
 		BackupPolicy:  NewBackupPolicy(10),
 		FailurePolicy: NewFailurePolicy(),
 	})
-	r = rc.getRetryer(genRPCInfo())
+	r = rc.getRetryer(context.Background(), genRPCInfo())
 	_, ok = r.(*failureRetryer)
 	test.Assert(t, ok)
 	_, allow = r.AllowRetry(context.Background())
@@ -68,7 +82,7 @@ func TestNewRetryContainer(t *testing.T) {
 		Type:         1,
 		BackupPolicy: NewBackupPolicy(20),
 	})
-	r = rc.getRetryer(genRPCInfo())
+	r = rc.getRetryer(context.Background(), genRPCInfo())
 	_, ok = r.(*backupRetryer)
 	test.Assert(t, ok)
 	_, allow = r.AllowRetry(context.Background())
@@ -79,477 +93,394 @@ func TestNewRetryContainer(t *testing.T) {
 		Type:         1,
 		BackupPolicy: NewBackupPolicy(20),
 	})
-	r = rc.getRetryer(genRPCInfo())
+	r = rc.getRetryer(context.Background(), genRPCInfo())
 	_, ok = r.(*backupRetryer)
 	test.Assert(t, ok)
 	_, allow = r.AllowRetry(context.Background())
 	test.Assert(t, !allow)
+}
 
-	// backupPolicy is nil
-	rc = NewRetryContainer()
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   1,
+// test invalid policy
+func TestRetryInvalidPolicyInit(t *testing.T) {
+	t.Run("type is mixedRetry but policy is not", func(t *testing.T) {
+		jsonRet := `{"enable":true,"type":1,
+"mixed_policy":{"retry_delay_ms":10,"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1,"min_sample":200}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":"{\"not_retry_for_timeout\":false,\"rpc_retry_code\":{\"all_error_code\":false,\"error_codes\":[103,1204]},\"biz_retry_code\":{\"all_error_code\":false,\"error_codes\":[]}}","extra_struct":{"not_retry_for_timeout":false,"rpc_retry_code":{"all_error_code":false,"error_codes":[103,1204]},"biz_retry_code":{"all_error_code":false,"error_codes":[]}}}
+}`
+		var p Policy
+		err := sonici.UnmarshalFromString(jsonRet, &p)
+		test.Assert(t, err == nil, err)
+
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, p)
+		test.Assert(t, strings.Contains(rc.msg, "BackupPolicy is nil or retry type not match"), rc.msg)
 	})
-	msg := "new retryer[test-Backup] failed, err=newBackupRetryer failed, err=BackupPolicy is nil or retry type not match, cannot do update in backupRetryer, at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
 
-	// backupPolicy config invalid
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   1,
-		BackupPolicy: &BackupPolicy{
-			RetryDelayMS: 0,
-		},
+	t.Run("type is backupRequest but policy is not", func(t *testing.T) {
+		jsonRet := `{"enable":true,"type":1,
+"mixed_policy":{"retry_delay_ms":10,"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1,"min_sample":200}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":"{\"not_retry_for_timeout\":false,\"rpc_retry_code\":{\"all_error_code\":false,\"error_codes\":[103,1204]},\"biz_retry_code\":{\"all_error_code\":false,\"error_codes\":[]}}","extra_struct":{"not_retry_for_timeout":false,"rpc_retry_code":{"all_error_code":false,"error_codes":[103,1204]},"biz_retry_code":{"all_error_code":false,"error_codes":[]}}},
+"failure_policy": {}
+}`
+		var p Policy
+		err := sonici.UnmarshalFromString(jsonRet, &p)
+		test.Assert(t, err == nil, err)
+
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, p)
+		test.Assert(t, strings.Contains(rc.msg, "BackupPolicy is nil or retry type not match"), rc.msg)
 	})
-	msg = "new retryer[test-Backup] failed, err=newBackupRetryer failed, err=invalid backup request delay duration or retryTimes, at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
 
-	// backupPolicy cBPolicy config invalid
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   1,
-		BackupPolicy: &BackupPolicy{
-			RetryDelayMS: 100,
-			StopPolicy: StopPolicy{
-				CBPolicy: CBPolicy{
-					ErrorRate: 0.4,
+	t.Run("type is mixedRetry but policy is empty", func(t *testing.T) {
+		jsonRet := `{"enable":true,"type":2}`
+		var p Policy
+		err := sonici.UnmarshalFromString(jsonRet, &p)
+		test.Assert(t, err == nil, err)
+
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, p)
+		test.Assert(t, strings.Contains(rc.msg, "MixedPolicy is nil or retry type not match"), rc.msg)
+	})
+
+	t.Run("type is failureRetry but policy is not", func(t *testing.T) {
+		jsonRet := `{"enable":true,"type":0,
+"mixed_policy":{"retry_delay_ms":10,"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1,"min_sample":200}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":"{\"not_retry_for_timeout\":false,\"rpc_retry_code\":{\"all_error_code\":false,\"error_codes\":[103,1204]},\"biz_retry_code\":{\"all_error_code\":false,\"error_codes\":[]}}","extra_struct":{"not_retry_for_timeout":false,"rpc_retry_code":{"all_error_code":false,"error_codes":[103,1204]},"biz_retry_code":{"all_error_code":false,"error_codes":[]}}}}`
+		var p Policy
+		err := sonici.UnmarshalFromString(jsonRet, &p)
+		test.Assert(t, err == nil, err)
+
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, p)
+		test.Assert(t, strings.Contains(rc.msg, "FailurePolicy is nil or retry type not match"), rc.msg)
+	})
+
+	t.Run("failurePolicy is nil", func(t *testing.T) {
+		rc := NewRetryContainer()
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   0,
+		})
+		test.Assert(t, strings.Contains(rc.msg, "FailurePolicy is nil or retry type not match"))
+	})
+
+	t.Run("backupPolicy is nil", func(t *testing.T) {
+		cbs := newCBSuite(nil)
+		rc := NewRetryContainerWithCBStat(cbs.ServiceControl(), cbs.ServicePanel())
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   1,
+		})
+		test.Assert(t, strings.Contains(rc.msg, "BackupPolicy is nil or retry type not match"))
+	})
+
+	t.Run("mixedPolicy is nil", func(t *testing.T) {
+		rc := NewRetryContainer()
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   2,
+		})
+		test.Assert(t, strings.Contains(rc.msg, "MixedPolicy is nil or retry type not match"))
+	})
+
+	t.Run("backupPolicy config invalid", func(t *testing.T) {
+		rc := NewRetryContainer()
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   1,
+			BackupPolicy: &BackupPolicy{
+				RetryDelayMS: 0,
+			},
+		})
+		msg := "new retryer[test-Backup] failed, err=newBackupRetryer failed, err=invalid retry delay duration in backupRetryer, at "
+		test.Assert(t, rc.msg[:len(msg)] == msg, rc.msg)
+	})
+
+	t.Run("backupPolicy config invalid", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   1,
+			BackupPolicy: &BackupPolicy{
+				RetryDelayMS: 100,
+				StopPolicy: StopPolicy{
+					CBPolicy: CBPolicy{
+						ErrorRate: 0.4,
+					},
 				},
 			},
-		},
+		})
+		msg := "new retryer[test-Backup] at "
+		test.Assert(t, rc.msg[:len(msg)] == msg)
 	})
-	msg = "new retryer[test-Backup] at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
 
-	// failurePolicy config invalid
-	rc = NewRetryContainer()
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   0,
-		FailurePolicy: &FailurePolicy{
-			StopPolicy: StopPolicy{
-				MaxRetryTimes: 6,
-			},
-		},
-	})
-	msg = "new retryer[test-Failure] failed, err=newfailureRetryer failed, err=invalid failure MaxRetryTimes[6], at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
-
-	// failurePolicy cBPolicy config invalid
-	rc = NewRetryContainer()
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   0,
-		FailurePolicy: &FailurePolicy{
-			StopPolicy: StopPolicy{
-				MaxRetryTimes: 5,
-				CBPolicy: CBPolicy{
-					ErrorRate: 0.4,
+	t.Run("failurePolicy config invalid", func(t *testing.T) {
+		cbs := newCBSuite(nil)
+		rc := NewRetryContainerWithCBStat(cbs.ServiceControl(), cbs.ServicePanel())
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   0,
+			FailurePolicy: &FailurePolicy{
+				StopPolicy: StopPolicy{
+					MaxRetryTimes: 6,
 				},
 			},
-		},
+		})
+		msg := "new retryer[test-Failure] failed, err=newfailureRetryer failed, err=invalid MaxRetryTimes[6], at "
+		test.Assert(t, rc.msg[:len(msg)] == msg, rc.msg)
 	})
-	msg = "new retryer[test-Failure] at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
 
-	// failurePolicy backOffPolicy fixedBackOffType cfg is nil
-	rc = NewRetryContainerWithCB(nil, nil)
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   0,
-		FailurePolicy: &FailurePolicy{
-			StopPolicy: StopPolicy{
-				MaxRetryTimes: 5,
-			},
-			BackOffPolicy: &BackOffPolicy{
-				BackOffType: FixedBackOffType,
-			},
-		},
-	})
-	msg = "new retryer[test-Failure] at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
-
-	// failurePolicy backOffPolicy fixedBackOffType cfg invalid
-	rc = NewRetryContainerWithCB(nil, nil)
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   0,
-		FailurePolicy: &FailurePolicy{
-			StopPolicy: StopPolicy{
-				MaxRetryTimes: 5,
-			},
-			BackOffPolicy: &BackOffPolicy{
-				BackOffType: FixedBackOffType,
-				CfgItems: map[BackOffCfgKey]float64{
-					FixMSBackOffCfgKey: 0,
+	t.Run("failurePolicy cBPolicy config invalid", func(t *testing.T) {
+		rc := NewRetryContainer()
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   0,
+			FailurePolicy: &FailurePolicy{
+				StopPolicy: StopPolicy{
+					MaxRetryTimes: 5,
+					CBPolicy: CBPolicy{
+						ErrorRate: 0.4,
+					},
 				},
 			},
-		},
+		})
+		msg := "new retryer[test-Failure] at "
+		test.Assert(t, rc.msg[:len(msg)] == msg)
 	})
-	msg = "new retryer[test-Failure] at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
 
-	// failurePolicy backOffPolicy randomBackOffType cfg is nil
-	rc = NewRetryContainerWithCB(nil, nil)
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   0,
-		FailurePolicy: &FailurePolicy{
-			StopPolicy: StopPolicy{
-				MaxRetryTimes: 5,
-			},
-			BackOffPolicy: &BackOffPolicy{
-				BackOffType: RandomBackOffType,
-			},
-		},
-	})
-	msg = "new retryer[test-Failure] at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
-
-	// failurePolicy backOffPolicy randomBackOffType cfg invalid
-	rc = NewRetryContainerWithCB(nil, nil)
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   0,
-		FailurePolicy: &FailurePolicy{
-			StopPolicy: StopPolicy{
-				MaxRetryTimes: 5,
-			},
-			BackOffPolicy: &BackOffPolicy{
-				BackOffType: RandomBackOffType,
-				CfgItems: map[BackOffCfgKey]float64{
-					MinMSBackOffCfgKey: 20,
-					MaxMSBackOffCfgKey: 10,
+	t.Run("failurePolicy backOffPolicy fixedBackOffType cfg is nil", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   0,
+			FailurePolicy: &FailurePolicy{
+				StopPolicy: StopPolicy{
+					MaxRetryTimes: 5,
+				},
+				BackOffPolicy: &BackOffPolicy{
+					BackOffType: FixedBackOffType,
 				},
 			},
-		},
+		})
+		msg := "new retryer[test-Failure] at "
+		test.Assert(t, rc.msg[:len(msg)] == msg)
 	})
-	msg = "new retryer[test-Failure] at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
 
-	// failurePolicy backOffPolicy randomBackOffType normal
-	rc = NewRetryContainerWithCB(nil, nil)
-	rc.NotifyPolicyChange(method, Policy{
-		Enable: true,
-		Type:   0,
-		FailurePolicy: &FailurePolicy{
-			StopPolicy: StopPolicy{
-				MaxRetryTimes: 5,
-			},
-			BackOffPolicy: &BackOffPolicy{
-				BackOffType: RandomBackOffType,
-				CfgItems: map[BackOffCfgKey]float64{
-					MinMSBackOffCfgKey: 10,
-					MaxMSBackOffCfgKey: 20,
+	t.Run("failurePolicy backOffPolicy fixedBackOffType cfg invalid", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   0,
+			FailurePolicy: &FailurePolicy{
+				StopPolicy: StopPolicy{
+					MaxRetryTimes: 5,
+				},
+				BackOffPolicy: &BackOffPolicy{
+					BackOffType: FixedBackOffType,
+					CfgItems: map[BackOffCfgKey]float64{
+						FixMSBackOffCfgKey: 0,
+					},
 				},
 			},
-		},
+		})
+		msg := "new retryer[test-Failure] at "
+		test.Assert(t, rc.msg[:len(msg)] == msg)
 	})
-	msg = "new retryer[test-Failure] at "
-	test.Assert(t, rc.msg[:len(msg)] == msg)
 
-	// test init invalid case
-	err := rc.Init(nil, nil)
-	test.Assert(t, err == nil, err)
-	err = rc.Init(map[string]Policy{Wildcard: {
-		Enable: true,
-		Type:   1,
-		BackupPolicy: &BackupPolicy{
-			RetryDelayMS: 0,
-		},
-	}}, nil)
-	test.Assert(t, err != nil, err)
+	t.Run("failurePolicy backOffPolicy randomBackOffType cfg is nil", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   0,
+			FailurePolicy: &FailurePolicy{
+				StopPolicy: StopPolicy{
+					MaxRetryTimes: 5,
+				},
+				BackOffPolicy: &BackOffPolicy{
+					BackOffType: RandomBackOffType,
+				},
+			},
+		})
+		msg := "new retryer[test-Failure] at "
+		test.Assert(t, rc.msg[:len(msg)] == msg)
+	})
+
+	t.Run("failurePolicy backOffPolicy randomBackOffType cfg invalid", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   0,
+			FailurePolicy: &FailurePolicy{
+				StopPolicy: StopPolicy{
+					MaxRetryTimes: 5,
+				},
+				BackOffPolicy: &BackOffPolicy{
+					BackOffType: RandomBackOffType,
+					CfgItems: map[BackOffCfgKey]float64{
+						MinMSBackOffCfgKey: 20,
+						MaxMSBackOffCfgKey: 10,
+					},
+				},
+			},
+		})
+		msg := "new retryer[test-Failure] at "
+		test.Assert(t, rc.msg[:len(msg)] == msg)
+	})
+
+	t.Run("failurePolicy backOffPolicy randomBackOffType normal", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		rc.NotifyPolicyChange(method, Policy{
+			Enable: true,
+			Type:   0,
+			FailurePolicy: &FailurePolicy{
+				StopPolicy: StopPolicy{
+					MaxRetryTimes: 5,
+				},
+				BackOffPolicy: &BackOffPolicy{
+					BackOffType: RandomBackOffType,
+					CfgItems: map[BackOffCfgKey]float64{
+						MinMSBackOffCfgKey: 10,
+						MaxMSBackOffCfgKey: 20,
+					},
+				},
+			},
+		})
+		msg := "new retryer[test-Failure] at "
+		test.Assert(t, rc.msg[:len(msg)] == msg)
+	})
+
+	t.Run("test init invalid case", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		err := rc.Init(nil, nil)
+		test.Assert(t, err == nil, err)
+		err = rc.Init(map[string]Policy{Wildcard: {
+			Enable: true,
+			Type:   1,
+			BackupPolicy: &BackupPolicy{
+				RetryDelayMS: 0,
+			},
+		}}, nil)
+		test.Assert(t, err != nil, err)
+
+		rc.DeletePolicy(method)
+		r := rc.getRetryer(context.Background(), genRPCInfo())
+		test.Assert(t, r == nil)
+	})
 }
 
 // test container dump
 func TestContainer_Dump(t *testing.T) {
 	// test backupPolicy dump
-	rc := NewRetryContainerWithCB(nil, nil)
-	methodPolicies := map[string]Policy{
-		method: {
+	t.Run("backupPolicy dump", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		methodPolicies := map[string]Policy{
+			method: {
+				Enable:       true,
+				Type:         BackupType,
+				BackupPolicy: NewBackupPolicy(20),
+			},
+		}
+		err := rc.Init(methodPolicies, nil)
+		test.Assert(t, err == nil, err)
+		rcDump, ok := rc.Dump().(map[string]interface{})
+		test.Assert(t, ok)
+		hasCodeCfg := rcDump["has_code_cfg"].(bool)
+		test.Assert(t, hasCodeCfg)
+		testStr, err := sonici.MarshalToString(rcDump[method])
+		msg := `{"backup_request":{"retry_delay_ms":20,"stop_policy":{"max_retry_times":1,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1}},"retry_same_node":false},"enable":true}`
+		test.Assert(t, err == nil, err)
+		test.Assert(t, testStr == msg)
+	})
+
+	// test backupPolicy dump
+	t.Run("backupPolicy dump without code_cfg", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		policy := Policy{
 			Enable:       true,
 			Type:         1,
 			BackupPolicy: NewBackupPolicy(20),
-		},
-	}
-	rc.InitWithPolicies(methodPolicies)
-	err := rc.Init(map[string]Policy{Wildcard: {
-		Enable:       true,
-		Type:         1,
-		BackupPolicy: NewBackupPolicy(20),
-	}}, nil)
-	test.Assert(t, err == nil, err)
-	rcDump, ok := rc.Dump().(map[string]interface{})
-	test.Assert(t, ok)
-	hasCodeCfg, err := jsoni.MarshalToString(rcDump["has_code_cfg"])
-	test.Assert(t, err == nil, err)
-	test.Assert(t, hasCodeCfg == "true", hasCodeCfg)
-	testStr, err := jsoni.MarshalToString(rcDump["test"])
-	msg := `{"backupRequest":{"retry_delay_ms":20,"stop_policy":{"max_retry_times":1,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1}},"retry_same_node":false},"enable":true}`
-	test.Assert(t, err == nil, err)
-	test.Assert(t, testStr == msg)
+		}
+		err := rc.Init(nil, nil)
+		rc.NotifyPolicyChange(method, policy)
+		test.Assert(t, err == nil, err)
+		rcDump, ok := rc.Dump().(map[string]interface{})
+		test.Assert(t, ok)
+		hasCodeCfg := rcDump["has_code_cfg"].(bool)
+		test.Assert(t, !hasCodeCfg)
+		testStr, err := sonici.MarshalToString(rcDump[method])
+		msg := `{"backup_request":{"retry_delay_ms":20,"stop_policy":{"max_retry_times":1,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1}},"retry_same_node":false},"enable":true}`
+		test.Assert(t, err == nil, err)
+		test.Assert(t, testStr == msg)
+	})
 
 	// test failurePolicy dump
-	rc = NewRetryContainerWithCB(nil, nil)
-	methodPolicies = map[string]Policy{
-		method: {
-			Enable:        true,
-			Type:          FailureType,
-			FailurePolicy: NewFailurePolicy(),
-		},
-	}
-	rc.InitWithPolicies(methodPolicies)
-	err = rc.Init(map[string]Policy{Wildcard: {
-		Enable:        true,
-		Type:          FailureType,
-		FailurePolicy: NewFailurePolicy(),
-	}}, nil)
-	test.Assert(t, err == nil, err)
-	rcDump, ok = rc.Dump().(map[string]interface{})
-	test.Assert(t, ok)
-	hasCodeCfg, err = jsoni.MarshalToString(rcDump["has_code_cfg"])
-	test.Assert(t, err == nil, err)
-	test.Assert(t, hasCodeCfg == "true")
-	testStr, err = jsoni.MarshalToString(rcDump["test"])
-	msg = `{"enable":true,"failure_retry":{"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false},"specified_result_retry":{"error_retry":false,"resp_retry":false}}`
-	test.Assert(t, err == nil, err)
-	test.Assert(t, testStr == msg, testStr)
-}
-
-// test FailurePolicy call
-func TestFailurePolicyCall(t *testing.T) {
-	// call while rpc timeout
-	ctx := context.Background()
-	rc := NewRetryContainer()
-	failurePolicy := NewFailurePolicy()
-	failurePolicy.BackOffPolicy.BackOffType = FixedBackOffType
-	failurePolicy.BackOffPolicy.CfgItems = map[BackOffCfgKey]float64{
-		FixMSBackOffCfgKey: 100.0,
-	}
-	failurePolicy.StopPolicy.MaxDurationMS = 100
-	err := rc.Init(map[string]Policy{Wildcard: {
-		Enable:        true,
-		Type:          0,
-		FailurePolicy: failurePolicy,
-	}}, nil)
-	test.Assert(t, err == nil, err)
-	ri := genRPCInfo()
-	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-	ok, err := rc.WithRetryIfNeeded(ctx, Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
-		return ri, nil, kerrors.ErrRPCTimeout
-	}, ri, nil)
-	test.Assert(t, err != nil, err)
-	test.Assert(t, !ok)
-
-	// call normal
-	failurePolicy.StopPolicy.MaxDurationMS = 0
-	err = rc.Init(map[string]Policy{Wildcard: {
-		Enable:        true,
-		Type:          0,
-		FailurePolicy: failurePolicy,
-	}}, nil)
-	test.Assert(t, err == nil, err)
-	ok, err = rc.WithRetryIfNeeded(ctx, Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
-		return ri, nil, nil
-	}, ri, nil)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, ok)
-}
-
-// test retry with one time policy
-func TestRetryWithOneTimePolicy(t *testing.T) {
-	// call while rpc timeout and exceed MaxDurationMS cause BackOffPolicy is wait fix 100ms, it is invalid config
-	failurePolicy := NewFailurePolicy()
-	failurePolicy.BackOffPolicy.BackOffType = FixedBackOffType
-	failurePolicy.BackOffPolicy.CfgItems = map[BackOffCfgKey]float64{
-		FixMSBackOffCfgKey: 100.0,
-	}
-	failurePolicy.StopPolicy.MaxDurationMS = 100
-	p := Policy{
-		Enable:        true,
-		Type:          0,
-		FailurePolicy: failurePolicy,
-	}
-	ri := genRPCInfo()
-	ctx := rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
-	ok, err := NewRetryContainer().WithRetryIfNeeded(ctx, p, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
-		return ri, nil, kerrors.ErrRPCTimeout
-	}, ri, nil)
-	test.Assert(t, err != nil, err)
-	test.Assert(t, !ok)
-
-	// call no MaxDurationMS limit, the retry will success
-	failurePolicy.StopPolicy.MaxDurationMS = 0
-	var callTimes int32
-	ctx = rpcinfo.NewCtxWithRPCInfo(context.Background(), genRPCInfo())
-	ok, err = NewRetryContainer().WithRetryIfNeeded(ctx, p, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
-		if atomic.LoadInt32(&callTimes) == 0 {
-			atomic.AddInt32(&callTimes, 1)
-			return ri, nil, kerrors.ErrRPCTimeout
+	t.Run("failurePolicy dump", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		methodPolicies := map[string]Policy{
+			method: {
+				Enable:        true,
+				Type:          FailureType,
+				FailurePolicy: NewFailurePolicy(),
+			},
 		}
-		return ri, nil, nil
-	}, ri, nil)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, !ok)
+		err := rc.Init(methodPolicies, nil)
+		test.Assert(t, err == nil, err)
+		rcDump, ok := rc.Dump().(map[string]interface{})
+		test.Assert(t, ok)
+		hasCodeCfg := rcDump["has_code_cfg"].(bool)
+		test.Assert(t, hasCodeCfg)
+		testStr, err := sonici.MarshalToString(rcDump[method])
+		msg := `{"enable":true,"failure_retry":{"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":""},"specified_result_retry":{"error_retry":false,"old_error_retry":false,"old_resp_retry":false,"resp_retry":false}}`
+		test.Assert(t, err == nil, err)
+		test.Assert(t, testStr == msg, testStr)
+	})
 
-	// call backup request
-	p = BuildBackupRequest(NewBackupPolicy(10))
-	ctx = rpcinfo.NewCtxWithRPCInfo(context.Background(), genRPCInfo())
-	callTimes = 0
-	ok, err = NewRetryContainer().WithRetryIfNeeded(ctx, p, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
-		if atomic.LoadInt32(&callTimes) == 0 || atomic.LoadInt32(&callTimes) == 1 {
-			atomic.AddInt32(&callTimes, 1)
-			time.Sleep(time.Millisecond * 100)
+	// test mixedPolicy dump
+	t.Run("mixedPolicy dump", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		policy := Policy{
+			Enable:      true,
+			Type:        MixedType,
+			MixedPolicy: NewMixedPolicy(20),
 		}
-		return ri, nil, nil
-	}, ri, nil)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, !ok)
-	test.Assert(t, atomic.LoadInt32(&callTimes) == 2)
-}
+		err := rc.Init(nil, nil)
+		test.Assert(t, err == nil, err)
+		rc.NotifyPolicyChange(method, policy)
+		rcDump, ok := rc.Dump().(map[string]interface{})
+		test.Assert(t, ok)
+		hasCodeCfg := rcDump["has_code_cfg"].(bool)
+		test.Assert(t, !hasCodeCfg)
+		testStr, err := sonici.MarshalToString(rcDump[method])
+		msg := `{"enable":true,"mixed_retry":{"retry_delay_ms":20,"stop_policy":{"max_retry_times":1,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":""},"specified_result_retry":{"error_retry":false,"old_error_retry":false,"old_resp_retry":false,"resp_retry":false}}`
+		test.Assert(t, err == nil, err)
+		test.Assert(t, testStr == msg, testStr)
+	})
 
-// test specified error to retry
-func TestSpecifiedErrorRetry(t *testing.T) {
-	var callTimes int32
-	retryWithTransError := func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
-		newVal := atomic.AddInt32(&callTimes, 1)
-		if newVal == 1 {
-			return genRPCInfo(), nil, remote.NewTransErrorWithMsg(1000, "mock")
-		} else {
-			return genRPCInfo(), nil, nil
+	// test mixedPolicy dump
+	t.Run("mixedPolicy dump with customized retry", func(t *testing.T) {
+		rc := NewRetryContainerWithCB(nil, nil)
+		policy := Policy{
+			Enable:      true,
+			Type:        MixedType,
+			MixedPolicy: NewMixedPolicy(20),
 		}
-	}
-	ctx := context.Background()
-	ri := genRPCInfo()
-	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-	// case1: specified method retry with error
-	rc := NewRetryContainer()
-	shouldResultRetry := &ShouldResultRetry{ErrorRetry: func(err error, ri rpcinfo.RPCInfo) bool {
-		if ri.To().Method() == method {
-			if te, ok := err.(*remote.TransError); ok && te.TypeID() == 1000 {
-				return true
+		rr := &ShouldResultRetry{ErrorRetryWithCtx: func(ctx context.Context, err error, ri rpcinfo.RPCInfo) bool {
+			if ri.To().Method() == method {
+				if te, ok := err.(*remote.TransError); ok && te.TypeID() == 1000 {
+					return true
+				}
 			}
-		}
-		return false
-	}}
-	err := rc.Init(map[string]Policy{Wildcard: BuildFailurePolicy(NewFailurePolicy())}, shouldResultRetry)
-	test.Assert(t, err == nil, err)
-	ok, err := rc.WithRetryIfNeeded(ctx, Policy{}, retryWithTransError, ri, nil)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, !ok)
-
-	// case2: specified method retry with error, but use backup request config cannot be effective
-	atomic.StoreInt32(&callTimes, 0)
-	shouldResultRetry = &ShouldResultRetry{ErrorRetry: func(err error, ri rpcinfo.RPCInfo) bool {
-		if ri.To().Method() == method {
-			if te, ok := err.(*remote.TransError); ok && te.TypeID() == 1000 {
-				return true
-			}
-		}
-		return false
-	}}
-	rc = NewRetryContainer()
-	err = rc.Init(map[string]Policy{Wildcard: BuildBackupRequest(NewBackupPolicy(10))}, shouldResultRetry)
-	test.Assert(t, err == nil, err)
-	ok, err = rc.WithRetryIfNeeded(ctx, Policy{}, retryWithTransError, ri, nil)
-	test.Assert(t, err != nil, err)
-	test.Assert(t, !ok)
-
-	// case3: specified method retry with error, but method not match
-	atomic.StoreInt32(&callTimes, 0)
-	shouldResultRetry = &ShouldResultRetry{ErrorRetry: func(err error, ri rpcinfo.RPCInfo) bool {
-		if ri.To().Method() != method {
-			if te, ok := err.(*remote.TransError); ok && te.TypeID() == 1000 {
-				return true
-			}
-		}
-		return false
-	}}
-	rc = NewRetryContainer()
-	err = rc.Init(map[string]Policy{method: BuildFailurePolicy(NewFailurePolicy())}, shouldResultRetry)
-	test.Assert(t, err == nil, err)
-	ok, err = rc.WithRetryIfNeeded(ctx, Policy{}, retryWithTransError, ri, nil)
-	test.Assert(t, err != nil)
-	test.Assert(t, !ok)
-
-	// case4: all error retry
-	atomic.StoreInt32(&callTimes, 0)
-	rc = NewRetryContainer()
-	p := BuildFailurePolicy(NewFailurePolicyWithResultRetry(AllErrorRetry()))
-	ok, err = rc.WithRetryIfNeeded(ctx, p, retryWithTransError, ri, nil)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, !ok)
-}
-
-// test specified resp to retry
-func TestSpecifiedRespRetry(t *testing.T) {
-	retryResult := &mockResult{}
-	retryResp := mockResp{
-		code: 500,
-		msg:  "retry",
-	}
-	noRetryResp := mockResp{
-		code: 0,
-		msg:  "noretry",
-	}
-	var callTimes int32
-	retryWithResp := func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
-		newVal := atomic.AddInt32(&callTimes, 1)
-		if newVal == 1 {
-			retryResult.SetResult(retryResp)
-			return genRPCInfo(), retryResult, nil
-		} else {
-			retryResult.SetResult(noRetryResp)
-			return genRPCInfo(), retryResult, nil
-		}
-	}
-	ctx := context.Background()
-	ri := genRPCInfo()
-	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-	rc := NewRetryContainer()
-	// case1: specified method retry with resp
-	shouldResultRetry := &ShouldResultRetry{RespRetry: func(resp interface{}, ri rpcinfo.RPCInfo) bool {
-		if ri.To().Method() == method {
-			if r, ok := resp.(*mockResult); ok && r.GetResult() == retryResp {
-				return true
-			}
-		}
-		return false
-	}}
-	err := rc.Init(map[string]Policy{Wildcard: BuildFailurePolicy(NewFailurePolicy())}, shouldResultRetry)
-	test.Assert(t, err == nil, err)
-	ok, err := rc.WithRetryIfNeeded(ctx, Policy{}, retryWithResp, ri, nil)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, retryResult.GetResult() == noRetryResp, retryResult)
-	test.Assert(t, !ok)
-
-	// case2 specified method retry with resp, but use backup request config cannot be effective
-	atomic.StoreInt32(&callTimes, 0)
-	rc = NewRetryContainer()
-	err = rc.Init(map[string]Policy{Wildcard: BuildBackupRequest(NewBackupPolicy(100))}, shouldResultRetry)
-	test.Assert(t, err == nil, err)
-	ok, err = rc.WithRetryIfNeeded(ctx, Policy{}, retryWithResp, ri, nil)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, retryResult.GetResult() == retryResp, retryResp)
-	test.Assert(t, !ok)
-
-	// case3: specified method retry with resp, but method not match
-	atomic.StoreInt32(&callTimes, 0)
-	shouldResultRetry = &ShouldResultRetry{RespRetry: func(resp interface{}, ri rpcinfo.RPCInfo) bool {
-		if ri.To().Method() != method {
-			if r, ok := resp.(*mockResult); ok && r.GetResult() == retryResp {
-				return true
-			}
-		}
-		return false
-	}}
-	rc = NewRetryContainer()
-	err = rc.Init(map[string]Policy{method: BuildFailurePolicy(NewFailurePolicy())}, shouldResultRetry)
-	test.Assert(t, err == nil, err)
-	ok, err = rc.WithRetryIfNeeded(ctx, Policy{}, retryWithResp, ri, nil)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, retryResult.GetResult() == retryResp, retryResult)
-	test.Assert(t, ok)
+			return false
+		}}
+		err := rc.Init(nil, rr)
+		test.Assert(t, err == nil, err)
+		rc.NotifyPolicyChange(method, policy)
+		rcDump, ok := rc.Dump().(map[string]interface{})
+		test.Assert(t, ok)
+		hasCodeCfg := rcDump["has_code_cfg"].(bool)
+		test.Assert(t, !hasCodeCfg)
+		testStr, err := sonici.MarshalToString(rcDump[method])
+		msg := `{"enable":true,"mixed_retry":{"retry_delay_ms":20,"stop_policy":{"max_retry_times":1,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":""},"specified_result_retry":{"error_retry":true,"old_error_retry":false,"old_resp_retry":false,"resp_retry":false}}`
+		test.Assert(t, err == nil, err)
+		test.Assert(t, testStr == msg, testStr)
+	})
 }
 
 // test different method use different retry policy
@@ -598,7 +529,7 @@ func TestDifferentMethodConfig(t *testing.T) {
 	// case1: test method do error retry
 	ri := genRPCInfo()
 	ctx := rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
-	ok, err := rc.WithRetryIfNeeded(ctx, Policy{}, rpcCall, ri, nil)
+	_, ok, err := rc.WithRetryIfNeeded(ctx, &Policy{}, rpcCall, ri, nil)
 	test.Assert(t, err == nil, err)
 	test.Assert(t, !ok)
 	lock.Lock()
@@ -611,46 +542,13 @@ func TestDifferentMethodConfig(t *testing.T) {
 	to := remoteinfo.NewRemoteInfo(&rpcinfo.EndpointBasicInfo{Method: method2}, method2).ImmutableView()
 	ri = rpcinfo.NewRPCInfo(to, to, rpcinfo.NewInvocation("", method2), rpcinfo.NewRPCConfig(), rpcinfo.NewRPCStats())
 	ctx = rpcinfo.NewCtxWithRPCInfo(context.Background(), ri)
-	ok, err = rc.WithRetryIfNeeded(ctx, Policy{}, rpcCall, ri, nil)
+	_, ok, err = rc.WithRetryIfNeeded(ctx, &Policy{}, rpcCall, ri, nil)
 	test.Assert(t, err == nil, err)
 	test.Assert(t, !ok)
 	lock.Lock()
 	_, ok = methodRetryer[method2].(*backupRetryer)
 	lock.Unlock()
 	test.Assert(t, ok)
-}
-
-// test BackupPolicy call while rpcTime > delayTime
-func TestBackupPolicyCall(t *testing.T) {
-	ctx := context.Background()
-	rc := NewRetryContainer()
-	err := rc.Init(map[string]Policy{Wildcard: {
-		Enable: true,
-		Type:   1,
-		BackupPolicy: &BackupPolicy{
-			RetryDelayMS: 30,
-			StopPolicy: StopPolicy{
-				MaxRetryTimes:    2,
-				DisableChainStop: false,
-				CBPolicy: CBPolicy{
-					ErrorRate: defaultCBErrRate,
-				},
-			},
-		},
-	}}, nil)
-	test.Assert(t, err == nil, err)
-
-	callTimes := int32(0)
-	ri := genRPCInfo()
-	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-	ok, err := rc.WithRetryIfNeeded(ctx, Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
-		atomic.AddInt32(&callTimes, 1)
-		time.Sleep(time.Millisecond * 50)
-		return ri, nil, nil
-	}, ri, nil)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, atomic.LoadInt32(&callTimes) == 2)
-	test.Assert(t, !ok)
 }
 
 // test policy noRetry call
@@ -663,7 +561,7 @@ func TestPolicyNoRetryCall(t *testing.T) {
 	var callTimes int32
 	ri := genRPCInfo()
 	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-	ok, err := rc.WithRetryIfNeeded(ctx, Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
+	_, ok, err := rc.WithRetryIfNeeded(ctx, &Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
 		atomic.AddInt32(&callTimes, 1)
 		return ri, nil, nil
 	}, ri, nil)
@@ -675,7 +573,7 @@ func TestPolicyNoRetryCall(t *testing.T) {
 	atomic.StoreInt32(&callTimes, 0)
 	ri = genRPCInfo()
 	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-	ok, err = rc.WithRetryIfNeeded(ctx, Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
+	_, ok, err = rc.WithRetryIfNeeded(ctx, &Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
 		atomic.AddInt32(&callTimes, 1)
 		if atomic.LoadInt32(&callTimes) == 1 {
 			return ri, nil, kerrors.ErrRPCTimeout
@@ -702,7 +600,7 @@ func TestPolicyNoRetryCall(t *testing.T) {
 	atomic.StoreInt32(&callTimes, 0)
 	ri = genRPCInfo()
 	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-	ok, err = rc.WithRetryIfNeeded(ctx, Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
+	_, ok, err = rc.WithRetryIfNeeded(ctx, &Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
 		atomic.AddInt32(&callTimes, 1)
 		if atomic.LoadInt32(&callTimes) == 1 {
 			return ri, nil, kerrors.ErrRPCTimeout
@@ -725,7 +623,7 @@ func TestPolicyNoRetryCall(t *testing.T) {
 	atomic.StoreInt32(&callTimes, 0)
 	ri = genRPCInfo()
 	ctx = rpcinfo.NewCtxWithRPCInfo(ctx, ri)
-	ok, err = rc.WithRetryIfNeeded(ctx, Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
+	_, ok, err = rc.WithRetryIfNeeded(ctx, &Policy{}, func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
 		atomic.AddInt32(&callTimes, 1)
 		time.Sleep(time.Millisecond * 100)
 		return ri, nil, nil
@@ -735,8 +633,37 @@ func TestPolicyNoRetryCall(t *testing.T) {
 	test.Assert(t, ok)
 }
 
+func retryCall(callTimes *int32, firstRI rpcinfo.RPCInfo, backup bool) RPCCallFunc {
+	// prevRI represents a value of rpcinfo.RPCInfo type.
+	var prevRI atomic.Value
+	return func(ctx context.Context, r Retryer) (rpcinfo.RPCInfo, interface{}, error) {
+		currCallTimes := int(atomic.AddInt32(callTimes, 1))
+		cRI := firstRI
+		if currCallTimes > 1 {
+			cRI = genRPCInfoWithFirstStats(firstRI)
+			cRI.Stats().Record(ctx, stats.RPCFinish, stats.StatusInfo, "")
+			remoteInfo := remoteinfo.AsRemoteInfo(cRI.To())
+			remoteInfo.SetInstance(discovery.NewInstance("tcp", "10.20.30.40:8888", 10, nil))
+			if prevRI.Load() == nil {
+				prevRI.Store(firstRI)
+			}
+			r.Prepare(ctx, prevRI.Load().(rpcinfo.RPCInfo), cRI)
+			prevRI.Store(cRI)
+			return cRI, nil, nil
+		} else {
+			if backup {
+				time.Sleep(20 * time.Millisecond)
+				return cRI, nil, nil
+			} else {
+				return cRI, nil, kerrors.ErrRPCTimeout
+			}
+		}
+	}
+}
+
 type mockResult struct {
-	result mockResp
+	result    mockResp
+	callTimes int32
 	sync.RWMutex
 }
 
@@ -745,14 +672,223 @@ type mockResp struct {
 	msg  string
 }
 
-func (r *mockResult) GetResult() interface{} {
+func (r *mockResult) getResult() interface{} {
 	r.RLock()
 	defer r.RUnlock()
 	return r.result
 }
 
-func (r *mockResult) SetResult(ret mockResp) {
+func (r *mockResult) setResult(ret mockResp) {
 	r.Lock()
 	defer r.Unlock()
 	r.result = ret
+}
+
+func (r *mockResult) setCallTimes(ct int32) {
+	r.Lock()
+	defer r.Unlock()
+	r.callTimes = ct
+}
+
+func (r *mockResult) getCallTimes() int32 {
+	r.RLock()
+	defer r.RUnlock()
+	return r.callTimes
+}
+
+func TestNewRetryContainerWithOptions(t *testing.T) {
+	t.Run("no_option", func(t *testing.T) {
+		rc := NewRetryContainer()
+		test.Assertf(t, rc.cbContainer.cbSuite != nil, "cb_suite nil")
+		test.Assertf(t, rc.cbContainer.cbStat == true, "cb_stat not true")
+	})
+
+	t.Run("percentage_limit", func(t *testing.T) {
+		rc := NewRetryContainer(WithContainerEnablePercentageLimit())
+		test.Assertf(t, rc.cbContainer.enablePercentageLimit == true, "percentage_limit not true")
+	})
+
+	t.Run("percentage_limit&&cbOptions", func(t *testing.T) {
+		cbSuite := newCBSuite(nil)
+		rc := NewRetryContainer(
+			WithContainerEnablePercentageLimit(),
+			WithContainerCBSuite(cbSuite),
+			WithContainerCBControl(cbSuite.ServiceControl()),
+			WithContainerCBPanel(cbSuite.ServicePanel()),
+		)
+		test.Assertf(t, rc.cbContainer.enablePercentageLimit == true, "percentage_limit not true")
+		test.Assertf(t, rc.cbContainer.cbSuite != cbSuite, "cbSuite not ignored")
+		test.Assertf(t, rc.cbContainer.cbCtl != cbSuite.ServiceControl(), "cbCtl not ignored")
+		test.Assertf(t, rc.cbContainer.cbPanel != cbSuite.ServicePanel(), "cbPanel not ignored")
+	})
+
+	t.Run("cb_stat", func(t *testing.T) {
+		rc := NewRetryContainer(WithContainerCBStat())
+		test.Assertf(t, rc.cbContainer.cbStat == true, "cb_stat not true")
+	})
+
+	t.Run("cb_suite", func(t *testing.T) {
+		cbs := newCBSuite(nil)
+		rc := NewRetryContainer(WithContainerCBSuite(cbs))
+		test.Assert(t, rc.cbContainer.cbSuite == cbs, "cbSuite expected %p, got %p", cbs, rc.cbContainer.cbSuite)
+	})
+
+	t.Run("cb_control&cb_panel", func(t *testing.T) {
+		cbs := newCBSuite(nil)
+		rc := NewRetryContainer(
+			WithContainerCBControl(cbs.ServiceControl()),
+			WithContainerCBPanel(cbs.ServicePanel()))
+		test.Assert(t, rc.cbContainer.cbCtl == cbs.ServiceControl(), "cbControl not match")
+		test.Assert(t, rc.cbContainer.cbPanel == cbs.ServicePanel(), "cbPanel not match")
+	})
+
+	t.Run("CBSuiteOptions", func(t *testing.T) {
+		f := func(ctx context.Context, request, response interface{}, err error) circuitbreak.ErrorType {
+			return circuitbreak.TypeSuccess
+		}
+		opts := []circuitbreak.CBSuiteOption{
+			circuitbreak.WithServiceGetErrorType(f),
+		}
+
+		// test
+		rc := NewRetryContainer(WithContainerCBSuiteOptions(opts...))
+		serviceControl := rc.cbContainer.cbSuite.ServiceControl()
+
+		// check
+		test.Assert(t, len(rc.cbContainer.cbSuiteOptions) == 1)
+		test.Assert(t, reflect.ValueOf(serviceControl.GetErrorType).Pointer() == reflect.ValueOf(f).Pointer())
+	})
+
+	t.Run("CBSuiteOptions&PercentageLimit", func(t *testing.T) {
+		f := func(ctx context.Context, request, response interface{}, err error) circuitbreak.ErrorType {
+			return circuitbreak.TypeSuccess
+		}
+		opts := []circuitbreak.CBSuiteOption{
+			circuitbreak.WithServiceGetErrorType(f),
+		}
+
+		// test
+		rc := NewRetryContainer(WithContainerEnablePercentageLimit(), WithContainerCBSuiteOptions(opts...))
+		serviceControl := rc.cbContainer.cbSuite.ServiceControl()
+
+		// check
+		test.Assert(t, len(rc.cbContainer.cbSuiteOptions) == 1)
+		test.Assert(t, reflect.ValueOf(serviceControl.GetErrorType).Pointer() == reflect.ValueOf(f).Pointer())
+	})
+}
+
+func TestNewRetryContainerWithCBStat(t *testing.T) {
+	cbs := newCBSuite(nil)
+	rc := NewRetryContainerWithCBStat(cbs.ServiceControl(), cbs.ServicePanel())
+	test.Assert(t, rc.cbContainer.cbCtl == cbs.ServiceControl(), "cbControl not match")
+	test.Assert(t, rc.cbContainer.cbPanel == cbs.ServicePanel(), "cbPanel not match")
+	test.Assertf(t, rc.cbContainer.cbStat == true, "cb_stat not true")
+	rc.Close()
+}
+
+func TestNewRetryContainerWithCB(t *testing.T) {
+	cbs := newCBSuite(nil)
+	rc := NewRetryContainerWithCB(cbs.ServiceControl(), cbs.ServicePanel())
+	test.Assert(t, rc.cbContainer.cbCtl == cbs.ServiceControl(), "cbControl not match")
+	test.Assert(t, rc.cbContainer.cbPanel == cbs.ServicePanel(), "cbPanel not match")
+	test.Assertf(t, rc.cbContainer.cbStat == false, "cb_stat not false")
+	rc.Close()
+}
+
+func TestPrepareRetryContext(t *testing.T) {
+	ctx := PrepareRetryContext(context.Background())
+
+	test.Assert(t, *ctx.Value(CtxReqOp).(*int32) == OpNo)
+	test.Assert(t, *ctx.Value(CtxRespOp).(*int32) == OpNo)
+	*ctx.Value(CtxReqOp).(*int32) = OpDone
+	*ctx.Value(CtxRespOp).(*int32) = OpDone
+
+	test.Assert(t, *ctx.Value(CtxReqOp).(*int32) == OpDone)
+	test.Assert(t, *ctx.Value(CtxRespOp).(*int32) == OpDone)
+}
+
+var gctx context.Context // make sure the return value of PrepareRetryContext escapes
+
+func BenchmarkPrepareRetryContext(b *testing.B) {
+	var ctx context.Context
+	for i := 0; i < b.N; i++ {
+		ctx = PrepareRetryContext(context.Background())
+		_ = ctx.Value(CtxReqOp)
+		_ = ctx.Value(CtxRespOp)
+	}
+	gctx = ctx
+}
+
+// v0.11.0 add type 2 - mixed retry, but the old version has bug that parse the data trigger panic
+// json is
+// {"enable":true,"type":2,
+// "mixed_policy":{"retry_delay_ms":10,"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1,"min_sample":200}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":"{\"not_retry_for_timeout\":false,\"rpc_retry_code\":{\"all_error_code\":false,\"error_codes\":[103,1204]},\"biz_retry_code\":{\"all_error_code\":false,\"error_codes\":[]}}","extra_struct":{"not_retry_for_timeout":false,"rpc_retry_code":{"all_error_code":false,"error_codes":[103,1204]},"biz_retry_code":{"all_error_code":false,"error_codes":[]}}}
+// }
+// actually, the test cases has cover the bug
+// this test case just to record the problem, and ignore it in the future
+func TestBugfix4InvalidRetry(t *testing.T) {
+	// <v0.11.0: newRetryer panic
+	// >v0.11.0: newRetryer successful, mixed retry
+	t.Run("type=2, mixed retry", func(t *testing.T) {
+		jsonRet := `{"enable":true,"type":2,
+"mixed_policy":{"retry_delay_ms":10,"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1,"min_sample":200}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":"{\"not_retry_for_timeout\":false,\"rpc_retry_code\":{\"all_error_code\":false,\"error_codes\":[103,1204]},\"biz_retry_code\":{\"all_error_code\":false,\"error_codes\":[]}}","extra_struct":{"not_retry_for_timeout":false,"rpc_retry_code":{"all_error_code":false,"error_codes":[103,1204]},"biz_retry_code":{"all_error_code":false,"error_codes":[]}}}
+}`
+		var p Policy
+		err := sonici.UnmarshalFromString(jsonRet, &p)
+		test.Assert(t, err == nil, err)
+
+		r, err := NewRetryer(p, nil, nil)
+		test.Assert(t, err == nil, err)
+		test.Assert(t, r.(*mixedRetryer).enable)
+	})
+
+	// expect
+	// <v0.11.0: newRetryer failed, type not match
+	// >v0.11.0: newRetryer successful, mixed retry
+	t.Run("type=2, mixed retry, but policy has empty failure_policy", func(t *testing.T) {
+		jsonRet := `{"enable":true,"type":2,
+"mixed_policy":{"retry_delay_ms":10,"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1,"min_sample":200}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":"{\"not_retry_for_timeout\":false,\"rpc_retry_code\":{\"all_error_code\":false,\"error_codes\":[103,1204]},\"biz_retry_code\":{\"all_error_code\":false,\"error_codes\":[]}}","extra_struct":{"not_retry_for_timeout":false,"rpc_retry_code":{"all_error_code":false,"error_codes":[103,1204]},"biz_retry_code":{"all_error_code":false,"error_codes":[]}}},
+"failure_policy": {}
+}`
+		var p Policy
+		err := sonici.UnmarshalFromString(jsonRet, &p)
+		test.Assert(t, err == nil, err)
+
+		r, err := NewRetryer(p, nil, nil)
+		test.Assert(t, err == nil, err)
+		test.Assert(t, r.(*mixedRetryer).enable)
+	})
+
+	// expect
+	// <v0.11.0: newRetryer failed, type not match
+	// >v0.11.0: newRetryer successful, mixed retry
+	t.Run("type=2, mixed retry, but policy has failure_policy", func(t *testing.T) {
+		jsonRet := `{"enable":true,"type":2,
+"mixed_policy":{"retry_delay_ms":10,"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1,"min_sample":200}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":"{\"not_retry_for_timeout\":false,\"rpc_retry_code\":{\"all_error_code\":false,\"error_codes\":[103,1204]},\"biz_retry_code\":{\"all_error_code\":false,\"error_codes\":[]}}","extra_struct":{"not_retry_for_timeout":false,"rpc_retry_code":{"all_error_code":false,"error_codes":[103,1204]},"biz_retry_code":{"all_error_code":false,"error_codes":[]}}},
+"failure_policy": {"stop_policy":{"max_retry_times":0,"max_duration_ms":0,"disable_chain_stop": false, "ddl_stop": false,"cb_policy": {"error_rate":0,"min_sample": 0}},"retry_same_node": false}
+}`
+		var p Policy
+		err := sonici.UnmarshalFromString(jsonRet, &p)
+		test.Assert(t, err == nil, err)
+
+		r, err := NewRetryer(p, nil, nil)
+		test.Assert(t, err == nil, err)
+		test.Assert(t, r.(*mixedRetryer).enable)
+	})
+
+	// expect
+	// <v0.11.0: newRetryer failed, panic
+	// >v0.11.0: newRetryer failed, type not match
+	t.Run("type=3, unknown retry with unknown policy", func(t *testing.T) {
+		jsonRet := `{"enable":true,"type":3,
+"new_policy":{"retry_delay_ms":10,"stop_policy":{"max_retry_times":2,"max_duration_ms":0,"disable_chain_stop":false,"ddl_stop":false,"cb_policy":{"error_rate":0.1,"min_sample":200}},"backoff_policy":{"backoff_type":"none"},"retry_same_node":false,"extra":"{\"not_retry_for_timeout\":false,\"rpc_retry_code\":{\"all_error_code\":false,\"error_codes\":[103,1204]},\"biz_retry_code\":{\"all_error_code\":false,\"error_codes\":[]}}","extra_struct":{"not_retry_for_timeout":false,"rpc_retry_code":{"all_error_code":false,"error_codes":[103,1204]},"biz_retry_code":{"all_error_code":false,"error_codes":[]}}}}`
+		var p Policy
+		err := sonici.UnmarshalFromString(jsonRet, &p)
+		test.Assert(t, err == nil, err)
+
+		r, err := NewRetryer(p, nil, nil)
+		test.Assert(t, err != nil, err)
+		test.Assert(t, r == nil)
+		test.Assert(t, strings.Contains(err.Error(), "FailurePolicy is nil or retry type not match"))
+	})
 }

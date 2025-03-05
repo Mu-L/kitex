@@ -55,6 +55,8 @@ const (
 	OpDone
 )
 
+var tagValueFirstTry = "0"
+
 // DDLStopFunc is the definition of ddlStop func
 type DDLStopFunc func(ctx context.Context, policy StopPolicy) (bool, string)
 
@@ -83,7 +85,7 @@ func chainStop(ctx context.Context, policy StopPolicy) (bool, string) {
 	if policy.DisableChainStop {
 		return false, ""
 	}
-	if _, exist := metainfo.GetPersistentValue(ctx, TransitKey); !exist {
+	if !IsRemoteRetryRequest(ctx) {
 		return false, ""
 	}
 	return true, "chain stop retry"
@@ -125,7 +127,7 @@ func makeRetryErr(ctx context.Context, msg string, callTimes int32) error {
 	ri := rpcinfo.GetRPCInfo(ctx)
 	to := ri.To()
 
-	errMsg := fmt.Sprintf("retry[%d] failed, %s, to=%s, method=%s", callTimes-1, msg, to.ServiceName(), to.Method())
+	errMsg := fmt.Sprintf("retry[%d] failed, %s, toService=%s, method=%s", callTimes-1, msg, to.ServiceName(), to.Method())
 	target := to.Address()
 	if target != nil {
 		errMsg = fmt.Sprintf("%s, remote=%s", errMsg, target.String())
@@ -156,10 +158,25 @@ func appendErrMsg(err error, msg string) {
 
 func recordRetryInfo(ri rpcinfo.RPCInfo, callTimes int32, lastCosts string) {
 	if callTimes > 1 {
-		if me := remoteinfo.AsRemoteInfo(ri.To()); me != nil {
-			me.SetTag(rpcinfo.RetryTag, strconv.Itoa(int(callTimes)-1))
+		if re := remoteinfo.AsRemoteInfo(ri.To()); re != nil {
+			re.SetTag(rpcinfo.RetryTag, strconv.Itoa(int(callTimes)-1))
 			// record last cost
-			me.SetTag(rpcinfo.RetryLastCostTag, lastCosts)
+			re.SetTag(rpcinfo.RetryLastCostTag, lastCosts)
 		}
 	}
+}
+
+// IsLocalRetryRequest checks whether it's a retry request by checking the RetryTag set in rpcinfo
+// It's supposed to be used in client middlewares
+func IsLocalRetryRequest(ctx context.Context) bool {
+	ri := rpcinfo.GetRPCInfo(ctx)
+	retryCountStr := ri.To().DefaultTag(rpcinfo.RetryTag, tagValueFirstTry)
+	return retryCountStr != tagValueFirstTry
+}
+
+// IsRemoteRetryRequest checks whether it's a retry request by checking the TransitKey in metainfo
+// It's supposed to be used in server side (handler/middleware)
+func IsRemoteRetryRequest(ctx context.Context) bool {
+	_, isRetry := metainfo.GetPersistentValue(ctx, TransitKey)
+	return isRetry
 }

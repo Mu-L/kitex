@@ -17,13 +17,14 @@
 package gonet
 
 import (
+	"context"
 	"net"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/cloudwego/kitex/internal/mocks"
-	internal_stats "github.com/cloudwego/kitex/internal/stats"
+	mocksremote "github.com/cloudwego/kitex/internal/mocks/remote"
 	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
@@ -41,6 +42,7 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	svcInfo := mocks.ServiceInfo()
 	svrOpt = &remote.ServerOption{
 		InitOrResetRPCInfoFunc: func(ri rpcinfo.RPCInfo, addr net.Addr) rpcinfo.RPCInfo {
 			fromInfo := rpcinfo.EmptyEndpointInfo()
@@ -55,10 +57,14 @@ func TestMain(m *testing.M) {
 		},
 		Codec: &MockCodec{
 			EncodeFunc: nil,
-			DecodeFunc: nil,
+			DecodeFunc: func(ctx context.Context, msg remote.Message, in remote.ByteBuffer) error {
+				msg.SpecifyServiceInfo(mocks.MockServiceName, mocks.MockMethod)
+				return nil
+			},
 		},
-		SvcInfo:   mocks.ServiceInfo(),
-		TracerCtl: &internal_stats.Controller{},
+		SvcSearcher:   mocksremote.NewDefaultSvcSearcher(),
+		TargetSvcInfo: svcInfo,
+		TracerCtl:     &rpcinfo.TraceController{},
 	}
 	svrTransHdlr, _ = newSvrTransHandler(svrOpt)
 	transSvr = NewTransServerFactory().NewTransServer(svrOpt, svrTransHdlr).(*transServer)
@@ -69,7 +75,7 @@ func TestMain(m *testing.M) {
 // TestCreateListener test trans_server CreateListener success
 func TestCreateListener(t *testing.T) {
 	// tcp init
-	addrStr := "127.0.0.1:9091"
+	addrStr := "127.0.0.1:9093"
 	addr = utils.NewNetAddr("tcp", addrStr)
 
 	// test

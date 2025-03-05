@@ -17,12 +17,12 @@ package thriftgo
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	"github.com/cloudwego/thriftgo/plugin"
 
 	"github.com/cloudwego/kitex/tool/internal_pkg/generator"
+	"github.com/cloudwego/kitex/tool/internal_pkg/util"
 )
 
 // PluginName is the link name when the kitex binary is used as a plugin for thriftgo.
@@ -34,7 +34,7 @@ const TheUseOptionMessage = "kitex_gen is not generated due to the -use option"
 // Run is an entry of the plugin mode of kitex for thriftgo.
 // It reads a plugin request from the standard input and writes out a response.
 func Run() int {
-	data, err := ioutil.ReadAll(os.Stdin)
+	data, err := util.ReadInput()
 	if err != nil {
 		println("Failed to get input:", err.Error())
 		return 1
@@ -46,19 +46,29 @@ func Run() int {
 		return 1
 	}
 
+	return exit(HandleRequest(req))
+}
+
+func (c *converter) failResp(err error) *plugin.Response {
+	return plugin.BuildErrorResponse(err.Error(), c.Warnings...)
+}
+
+func HandleRequest(req *plugin.Request) *plugin.Response {
 	var conv converter
-	if err = conv.init(req); err != nil {
-		return conv.fail(err)
+	if err := conv.init(req); err != nil {
+		return conv.failResp(err)
 	}
 
-	if err = conv.convertTypes(req); err != nil {
-		return conv.fail(err)
+	if err := conv.convertTypes(req); err != nil {
+		return conv.failResp(err)
 	}
 
 	conv.fixImportConflicts()
 
 	var files []*generator.File
 	gen := generator.NewGenerator(&conv.Config, nil)
+
+	conv.Package.IDLName = util.IDLName(conv.Config.IDL)
 
 	if conv.Config.Use == "" {
 		for _, s := range conv.Services {
@@ -67,7 +77,7 @@ func Run() int {
 			conv.Package.Namespace = conv.svc2ast[s].GetNamespaceOrReferenceName("go")
 			fs, err := gen.GenerateService(&conv.Package)
 			if err != nil {
-				return conv.fail(err)
+				return conv.failResp(err)
 			}
 			files = append(files, fs...)
 		}
@@ -75,12 +85,36 @@ func Run() int {
 
 	if conv.Config.GenerateMain {
 		if len(conv.Services) == 0 {
-			return conv.fail(errors.New("no service defined in the IDL"))
+			return conv.failResp(errors.New("no service defined in the IDL"))
 		}
-		conv.Package.ServiceInfo = conv.Services[len(conv.Services)-1]
+		if !conv.Config.IsUsingMultipleServicesTpl() {
+			// if -tpl multiple_services is not set, specify the last service as the target service
+			conv.Package.ServiceInfo = conv.Services[len(conv.Services)-1]
+		} else {
+			var svcs []*generator.ServiceInfo
+			for _, svc := range conv.Services {
+				if svc.GenerateHandler {
+					svc.RefName = "service" + svc.ServiceName
+					svcs = append(svcs, svc)
+				}
+			}
+			conv.Package.Services = svcs
+		}
 		fs, err := gen.GenerateMainPackage(&conv.Package)
 		if err != nil {
-			return conv.fail(err)
+			return conv.failResp(err)
+		}
+		files = append(files, fs...)
+	}
+
+	if conv.Config.TemplateDir != "" {
+		if len(conv.Services) == 0 {
+			return conv.failResp(errors.New("no service defined in the IDL"))
+		}
+		conv.Package.ServiceInfo = conv.Services[len(conv.Services)-1]
+		fs, err := gen.GenerateCustomPackage(&conv.Package)
+		if err != nil {
+			return conv.failResp(err)
 		}
 		files = append(files, fs...)
 	}
@@ -96,29 +130,36 @@ func Run() int {
 	}
 
 	if conv.Config.Use != "" {
-		err = conv.persist(res)
+		err := conv.persist(res)
 		if err == nil {
 			err = errors.New(TheUseOptionMessage)
 		}
-		return conv.fail(err)
+		return conv.failResp(err)
 	}
-
 	p := &patcher{
-		noFastAPI: conv.Config.NoFastAPI,
-		utils:     conv.Utils,
-		module:    conv.Config.ModuleName,
-		copyIDL:   conv.Config.CopyIDL,
-		version:   conv.Config.Version,
-		record:    conv.Config.Record,
-		recordCmd: conv.Config.RecordCmd,
+		noFastAPI:             conv.Config.NoFastAPI,
+		utils:                 conv.Utils,
+		module:                conv.Config.ModuleName,
+		copyIDL:               conv.Config.CopyIDL,
+		version:               conv.Config.Version,
+		record:                conv.Config.Record,
+		recordCmd:             conv.Config.RecordCmd,
+		deepCopyAPI:           conv.Config.DeepCopyAPI,
+		protocol:              conv.Config.Protocol,
+		handlerReturnKeepResp: conv.Config.HandlerReturnKeepResp,
+		frugalStruct:          conv.Config.FrugalStruct,
+	}
+	// for cmd without setting -module
+	if p.module == "" {
+		p.module = conv.Config.PackagePrefix
 	}
 	patches, err := p.patch(req)
 	if err != nil {
-		return conv.fail(fmt.Errorf("patch: %w", err))
+		return conv.failResp(fmt.Errorf("patch: %w", err))
 	}
 	res.Contents = append(res.Contents, patches...)
 
-	return exit(res)
+	return res
 }
 
 func exit(res *plugin.Response) int {

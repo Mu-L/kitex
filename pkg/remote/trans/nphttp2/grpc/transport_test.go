@@ -23,6 +23,7 @@ package grpc
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -40,10 +41,12 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
+	"github.com/cloudwego/kitex/internal/test"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc/grpcframe"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc/testutils"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
+	"github.com/cloudwego/kitex/pkg/utils"
 )
 
 type server struct {
@@ -55,6 +58,10 @@ type server struct {
 	conns      map[ServerTransport]bool
 	h          *testStreamHandler
 	ready      chan struct{}
+	hdlWG      sync.WaitGroup
+	transWG    sync.WaitGroup
+
+	srvReady chan struct{}
 }
 
 var (
@@ -63,6 +70,7 @@ var (
 	expectedRequestLarge       = make([]byte, initialWindowSize*2)
 	expectedResponseLarge      = make([]byte, initialWindowSize*2)
 	expectedInvalidHeaderField = "invalid/content-type"
+	errSelfCloseForTest        = errors.New("self-close in test")
 )
 
 func init() {
@@ -74,6 +82,7 @@ func init() {
 
 type testStreamHandler struct {
 	t           *http2Server
+	srv         *server
 	notify      chan struct{}
 	getNotified chan struct{}
 }
@@ -89,6 +98,9 @@ const (
 	invalidHeaderField
 	delayRead
 	pingpong
+
+	gracefulShutdown
+	cancel
 )
 
 func (h *testStreamHandler) handleStreamAndNotify(s *Stream) {
@@ -177,10 +189,9 @@ func (h *testStreamHandler) handleStreamMisbehave(t *testing.T, s *Stream) {
 			}
 		}
 		conn.controlBuf.put(&dataFrame{
-			streamID:    s.id,
-			h:           nil,
-			d:           p,
-			onEachWrite: func() {},
+			streamID: s.id,
+			h:        nil,
+			d:        p,
 		})
 		sent += len(p)
 	}
@@ -290,6 +301,35 @@ func (h *testStreamHandler) handleStreamDelayRead(t *testing.T, s *Stream) {
 	}
 }
 
+func (h *testStreamHandler) gracefulShutdown(t *testing.T, s *Stream) {
+	t.Log("run graceful shutdown")
+	close(h.srv.srvReady)
+	msg := make([]byte, 5)
+	num, err := s.Read(msg)
+	test.Assert(t, err == nil, err)
+	test.Assert(t, num == 5, num)
+	test.Assert(t, string(msg) == "hello", string(msg))
+	err = h.t.Write(s, nil, msg, &Options{})
+	test.Assert(t, err == nil, err)
+	_, err = s.Read(msg)
+	test.Assert(t, err != nil, err)
+	test.Assert(t, strings.Contains(err.Error(), gracefulShutdownMsg), err)
+	st, ok := status.FromError(err)
+	test.Assert(t, ok, err)
+	test.Assert(t, st.Code() == codes.Unavailable, st)
+}
+
+func (h *testStreamHandler) handleStreamCancel(t *testing.T, s *Stream) {
+	header := make([]byte, 5)
+	_, err := s.Read(header)
+	test.Assert(t, err != nil, err)
+	st, ok := status.FromError(err)
+	test.Assert(t, ok)
+	test.Assert(t, st.Code() == codes.Canceled, st.Code())
+	test.Assert(t, strings.Contains(st.Message(), "transport: RSTStream Frame received with error code"), st.Message())
+	close(h.srv.srvReady)
+}
+
 // start starts server. Other goroutines should block on s.readyChan for further operations.
 func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hType) {
 	// 创建 listener
@@ -310,7 +350,6 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 	}
 	s.port = p
 	s.conns = make(map[ServerTransport]bool)
-	s.startedErr <- nil
 
 	// handle: 连接读数据和处理逻辑
 	var onConnect netpoll.OnConnect = func(ctx context.Context, connection netpoll.Connection) context.Context {
@@ -327,6 +366,7 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 		s.conns[transport] = true
 		h := &testStreamHandler{t: transport.(*http2Server)}
 		s.h = h
+		h.srv = s
 		s.mu.Unlock()
 		switch ht {
 		case notifyCall:
@@ -377,12 +417,32 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 			}, func(ctx context.Context, method string) context.Context {
 				return ctx
 			})
-		default:
+		case gracefulShutdown:
+			s.transWG.Add(1)
+			go func() {
+				defer s.transWG.Done()
+				transport.HandleStreams(func(stream *Stream) {
+					s.hdlWG.Add(1)
+					go func() {
+						defer s.hdlWG.Done()
+						h.gracefulShutdown(t, stream)
+					}()
+				}, func(ctx context.Context, method string) context.Context { return ctx })
+			}()
+		case cancel:
 			go transport.HandleStreams(func(s *Stream) {
-				go h.handleStream(t, s)
+				go h.handleStreamCancel(t, s)
 			}, func(ctx context.Context, method string) context.Context {
 				return ctx
 			})
+		default:
+			go func() {
+				transport.HandleStreams(func(s *Stream) {
+					go h.handleStream(t, s)
+				}, func(ctx context.Context, method string) context.Context {
+					return ctx
+				})
+			}()
 		}
 		return ctx
 	}
@@ -398,6 +458,7 @@ func (s *server) start(t *testing.T, port int, serverConfig *ServerConfig, ht hT
 	if err != nil {
 		panic("create netpoll event-loop fail")
 	}
+	s.startedErr <- nil
 
 	// 运行 Server
 	err = s.eventLoop.Serve(s.lis)
@@ -420,9 +481,6 @@ func (s *server) wait(t *testing.T, timeout time.Duration) {
 func (s *server) stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := s.eventLoop.Shutdown(ctx); err != nil {
-		fmt.Printf("netpoll server exit failed, err=%v", err)
-	}
 	s.lis.Close()
 	s.mu.Lock()
 	for c := range s.conns {
@@ -430,6 +488,40 @@ func (s *server) stop() {
 	}
 	s.conns = nil
 	s.mu.Unlock()
+	if err := s.eventLoop.Shutdown(ctx); err != nil {
+		fmt.Printf("netpoll server exit failed, err=%v", err)
+	}
+}
+
+func (s *server) gracefulShutdown(finishCh chan struct{}) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	s.lis.Close()
+	s.mu.Lock()
+	for trans := range s.conns {
+		trans.Drain()
+	}
+	s.mu.Unlock()
+	timeout, _ := ctx.Deadline()
+	graceTimer := time.NewTimer(time.Until(timeout))
+	exitCh := make(chan struct{})
+	go func() {
+		select {
+		case <-graceTimer.C:
+			s.mu.Lock()
+			for trans := range s.conns {
+				trans.Close()
+			}
+			s.mu.Unlock()
+			return
+		case <-exitCh:
+			return
+		}
+	}()
+	s.hdlWG.Wait()
+	s.transWG.Wait()
+	close(exitCh)
+	close(finishCh)
 }
 
 func (s *server) addr() string {
@@ -440,7 +532,7 @@ func (s *server) addr() string {
 }
 
 func setUpServerOnly(t *testing.T, port int, serverConfig *ServerConfig, ht hType) *server {
-	server := &server{startedErr: make(chan error, 1), ready: make(chan struct{})}
+	server := &server{startedErr: make(chan error, 1), ready: make(chan struct{}), srvReady: make(chan struct{})}
 	go server.start(t, port, serverConfig, ht)
 	server.wait(t, time.Second)
 	return server
@@ -463,57 +555,62 @@ func setUpWithOptions(t *testing.T, port int, serverConfig *ServerConfig, ht hTy
 	return server, ct.(*http2Client)
 }
 
-func setUpWithNoPingServer(t *testing.T, copts ConnectOptions, connCh chan net.Conn) *http2Client {
+func setUpWithNoPingServer(t *testing.T, copts ConnectOptions, connCh chan net.Conn, exitCh chan struct{}) *http2Client {
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
-		fmt.Printf("Failed to listen: %v", err)
-		return nil
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	// Launch a non responsive server and save the conn.
+	eventLoop, err := netpoll.NewEventLoop(
+		func(ctx context.Context, connection netpoll.Connection) error { return nil },
+		netpoll.WithOnConnect(func(ctx context.Context, connection netpoll.Connection) context.Context {
+			connCh <- connection.(netpoll.Conn)
+			t.Logf("event loop on connect: %s", connection.RemoteAddr().String())
+			return ctx
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Create netpoll event-loop failed: %v", err)
 	}
 	go func() {
-		exitCh := make(chan struct{}, 1)
-		// Launch a non responsive server.
-		eventLoop, err := netpoll.NewEventLoop(func(ctx context.Context, connection netpoll.Connection) error {
-			defer lis.Close()
-			connCh <- connection.(net.Conn)
-			exitCh <- struct{}{}
-			return nil
-		})
-		if err != nil {
-			fmt.Printf("Create netpoll event-loop failed")
-		}
-
 		go func() {
 			err = eventLoop.Serve(lis)
 			if err != nil {
-				fmt.Printf("netpoll server exit failed, err=%v", err)
+				t.Errorf("netpoll server exit failed, err=%v", err)
+				return
 			}
 		}()
-
-		select {
-		case <-exitCh:
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			if err := eventLoop.Shutdown(ctx); err != nil {
-				fmt.Printf("netpoll server exit failed, err=%v", err)
-			}
-		default:
-		}
+		<-exitCh
+		// shutdown will called lis.Close()
+		_ = eventLoop.Shutdown(context.Background())
 	}()
 
 	conn, err := netpoll.NewDialer().DialTimeout("tcp", lis.Addr().String(), time.Second)
 	if err != nil {
-		fmt.Printf("Failed to dial: %v", err)
+		t.Fatalf("Failed to dial: %v", err)
 	}
 	tr, err := NewClientTransport(context.Background(), conn.(netpoll.Connection), copts, "mockDestService", func(GoAwayReason) {}, func() {})
 	if err != nil {
 		// Server clean-up.
-		lis.Close()
 		if conn, ok := <-connCh; ok {
 			conn.Close()
 		}
-		fmt.Printf("Failed to dial: %v", err)
+		t.Fatalf("Failed to dial: %v", err)
 	}
 	return tr.(*http2Client)
+}
+
+func setUpWithOnGoAway(t *testing.T, port int, serverConfig *ServerConfig, ht hType, copts ConnectOptions, onGoAway func(reason GoAwayReason)) (*server, *http2Client) {
+	server := setUpServerOnly(t, port, serverConfig, ht)
+	conn, err := netpoll.NewDialer().DialTimeout("tcp", "localhost:"+server.port, time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial connection: %v", err)
+	}
+	ct, connErr := NewClientTransport(context.Background(), conn.(netpoll.Connection), copts, "", onGoAway, func() {})
+	if connErr != nil {
+		t.Fatalf("failed to create transport: %v", connErr)
+	}
+	return server, ct.(*http2Client)
 }
 
 // TestInflightStreamClosing ensures that closing in-flight stream
@@ -522,7 +619,7 @@ func TestInflightStreamClosing(t *testing.T) {
 	serverConfig := &ServerConfig{}
 	server, client := setUpWithOptions(t, 0, serverConfig, suspended, ConnectOptions{})
 	defer server.stop()
-	defer client.Close()
+	defer client.Close(fmt.Errorf("self-close in test"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
@@ -552,7 +649,7 @@ func TestInflightStreamClosing(t *testing.T) {
 			<-timeout.C
 		}
 	case <-timeout.C:
-		t.Fatalf("Test timed out, expected a status error.")
+		t.Fatalf("%s", "Test timed out, expected a status error.")
 	}
 }
 
@@ -591,7 +688,7 @@ func TestClientSendAndReceive(t *testing.T) {
 	if recvErr != io.EOF {
 		t.Fatalf("Error: %v; want <EOF>", recvErr)
 	}
-	ct.Close()
+	ct.Close(errSelfCloseForTest)
 	server.stop()
 }
 
@@ -604,7 +701,7 @@ func TestClientErrorNotify(t *testing.T) {
 	}()
 	// ct.reader should detect the error and activate ct.Error().
 	<-ct.Error()
-	ct.Close()
+	ct.Close(nil)
 }
 
 func performOneRPC(ct ClientTransport) {
@@ -635,14 +732,14 @@ func performOneRPC(ct ClientTransport) {
 func TestClientMix(t *testing.T) {
 	s, ct := setUp(t, 0, math.MaxUint32, normal)
 	go func(s *server) {
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		s.stop()
 	}(s)
 	go func(ct ClientTransport) {
 		<-ct.Error()
-		ct.Close()
+		ct.Close(errSelfCloseForTest)
 	}(ct)
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 100; i++ {
 		time.Sleep(1 * time.Millisecond)
 		go performOneRPC(ct)
 	}
@@ -678,7 +775,7 @@ func TestLargeMessage(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	ct.Close()
+	ct.Close(errSelfCloseForTest)
 	server.stop()
 }
 
@@ -694,7 +791,7 @@ func TestLargeMessageWithDelayRead(t *testing.T) {
 	}
 	server, ct := setUpWithOptions(t, 0, sc, delayRead, co)
 	defer server.stop()
-	defer ct.Close()
+	defer ct.Close(errSelfCloseForTest)
 	server.mu.Lock()
 	ready := server.ready
 	server.mu.Unlock()
@@ -713,7 +810,7 @@ func TestLargeMessageWithDelayRead(t *testing.T) {
 	select {
 	case <-ready:
 	case <-ctx.Done():
-		t.Fatalf("Client timed out waiting for server handler to be initialized.")
+		t.Fatalf("%s", "Client timed out waiting for server handler to be initialized.")
 	}
 	server.mu.Lock()
 	serviceHandler := server.h
@@ -765,7 +862,7 @@ func TestLargeMessageWithDelayRead(t *testing.T) {
 	select {
 	case <-serviceHandler.notify:
 	case <-ctx.Done():
-		t.Fatalf("Client timed out")
+		t.Fatalf("%s", "Client timed out")
 	}
 	if _, err := s.Read(p); err != nil || !bytes.Equal(p, expectedResponseLarge) {
 		t.Fatalf("s.Read(_) = _, %v, want _, <nil>", err)
@@ -848,7 +945,7 @@ func TestLargeMessageSuspension(t *testing.T) {
 		Method: "foo.Large",
 	}
 	// Set a long enough timeout for writing a large message out.
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	s, err := ct.NewStream(ctx, callHdr)
 	if err != nil {
@@ -864,14 +961,12 @@ func TestLargeMessageSuspension(t *testing.T) {
 	msg := make([]byte, initialWindowSize*8)
 	ct.Write(s, nil, msg, &Options{})
 	err = ct.Write(s, nil, msg, &Options{Last: true})
-	if err != errStreamDone {
-		t.Fatalf("write got %v, want io.EOF", err)
-	}
+	test.Assert(t, errors.Is(err, ContextErr(ctx.Err())), err)
 	expectedErr := status.Err(codes.DeadlineExceeded, context.DeadlineExceeded.Error())
 	if _, err := s.Read(make([]byte, 8)); err.Error() != expectedErr.Error() {
 		t.Fatalf("Read got %v of type %T, want %v", err, err, expectedErr)
 	}
-	ct.Close()
+	ct.Close(errSelfCloseForTest)
 	server.stop()
 }
 
@@ -880,7 +975,7 @@ func TestMaxStreams(t *testing.T) {
 		MaxStreams: 1,
 	}
 	server, ct := setUpWithOptions(t, 0, serverConfig, suspended, ConnectOptions{})
-	defer ct.Close()
+	defer ct.Close(errSelfCloseForTest)
 	defer server.stop()
 	callHdr := &CallHdr{
 		Host:   "localhost",
@@ -902,10 +997,10 @@ func TestMaxStreams(t *testing.T) {
 	for {
 		select {
 		case <-timer.C:
-			t.Fatalf("Test timeout: client didn't receive server settings.")
+			t.Fatalf("%s", "Test timeout: client didn't receive server settings.")
 		default:
 		}
-		ctx, cancel := context.WithDeadline(pctx, time.Now().Add(time.Second))
+		ctx, cancel := context.WithDeadline(pctx, time.Now().Add(100*time.Millisecond))
 		// This is only to get rid of govet. All these context are based on a base
 		// context which is canceled at the end of the test.
 		defer cancel()
@@ -934,13 +1029,13 @@ func TestMaxStreams(t *testing.T) {
 	}
 	select {
 	case <-done:
-		t.Fatalf("Test failed: didn't expect new stream to be created just yet.")
+		t.Fatalf("%s", "Test failed: didn't expect new stream to be created just yet.")
 	default:
 	}
 	// Close the first stream created so that the new stream can finally be created.
 	ct.CloseStream(s, nil)
 	<-done
-	ct.Close()
+	ct.Close(errSelfCloseForTest)
 	<-ct.writerDone
 	if ct.maxConcurrentStreams != 1 {
 		t.Fatalf("ct.maxConcurrentStreams: %d, want 1", ct.maxConcurrentStreams)
@@ -979,16 +1074,15 @@ func TestServerContextCanceledOnClosedConnection(t *testing.T) {
 		t.Fatalf("Failed to open stream: %v", err)
 	}
 	ct.controlBuf.put(&dataFrame{
-		streamID:    s.id,
-		endStream:   false,
-		h:           nil,
-		d:           make([]byte, http2MaxFrameLen),
-		onEachWrite: func() {},
+		streamID:  s.id,
+		endStream: false,
+		h:         nil,
+		d:         make([]byte, http2MaxFrameLen),
 	})
 	// Loop until the server side stream is created.
 	var ss *Stream
 	for {
-		time.Sleep(time.Second)
+		time.Sleep(20 * time.Millisecond)
 		sc.mu.Lock()
 		if len(sc.activeStreams) == 0 {
 			sc.mu.Unlock()
@@ -998,14 +1092,14 @@ func TestServerContextCanceledOnClosedConnection(t *testing.T) {
 		sc.mu.Unlock()
 		break
 	}
-	ct.Close()
+	ct.Close(errSelfCloseForTest)
 	select {
 	case <-ss.Context().Done():
-		if ss.Context().Err() != context.Canceled {
-			t.Fatalf("ss.Context().Err() got %v, want %v", ss.Context().Err(), context.Canceled)
+		if ss.Context().Err() != errConnectionEOF {
+			t.Fatalf("ss.Context().Err() got %v, want %v", ss.Context().Err(), errConnectionEOF)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatalf("Failed to cancel the context of the sever side stream.")
+		t.Fatalf("%s", "Failed to cancel the context of the sever side stream.")
 	}
 	server.stop()
 }
@@ -1018,7 +1112,7 @@ func TestClientConnDecoupledFromApplicationRead(t *testing.T) {
 	}
 	server, client := setUpWithOptions(t, 0, &ServerConfig{}, notifyCall, connectOptions)
 	defer server.stop()
-	defer client.Close()
+	defer client.Close(errSelfCloseForTest)
 
 	waitWhileTrue(t, func() (bool, error) {
 		server.mu.Lock()
@@ -1106,7 +1200,7 @@ func TestServerConnDecoupledFromApplicationRead(t *testing.T) {
 	}
 	server, client := setUpWithOptions(t, 0, serverConfig, suspended, ConnectOptions{})
 	defer server.stop()
-	defer client.Close()
+	defer client.Close(errSelfCloseForTest)
 	waitWhileTrue(t, func() (bool, error) {
 		server.mu.Lock()
 		defer server.mu.Unlock()
@@ -1250,7 +1344,7 @@ func TestServerWithMisbehavedClient(t *testing.T) {
 	for {
 		select {
 		case <-timer.C:
-			t.Fatalf("Test timed out.")
+			t.Fatalf("%s", "Test timed out.")
 		case <-success:
 			return
 		default:
@@ -1452,8 +1546,11 @@ func TestEncodingRequiredStatus(t *testing.T) {
 		return
 	}
 	opts := Options{Last: true}
-	if err := ct.Write(s, nil, expectedRequest, &opts); err != nil && err != errStreamDone {
-		t.Fatalf("Failed to write the request: %v", err)
+	if err := ct.Write(s, nil, expectedRequest, &opts); err != nil {
+		// in case server-side returns earlier, Write also returns a status error.
+		if err != errStatusStreamDone || !testutils.StatusErrEqual(s.Status().Err(), encodingTestStatus.Err()) {
+			t.Fatalf("Failed to write the request: %v", err)
+		}
 	}
 	p := make([]byte, http2MaxFrameLen)
 	if _, err := s.trReader.(*transportReader).Read(p); err != io.EOF {
@@ -1462,7 +1559,7 @@ func TestEncodingRequiredStatus(t *testing.T) {
 	if !testutils.StatusErrEqual(s.Status().Err(), encodingTestStatus.Err()) {
 		t.Fatalf("stream with status %v, want %v", s.Status(), encodingTestStatus)
 	}
-	ct.Close()
+	ct.Close(errSelfCloseForTest)
 	server.stop()
 }
 
@@ -1483,26 +1580,26 @@ func TestInvalidHeaderField(t *testing.T) {
 	if se, ok := status.FromError(err); !ok || se.Code() != codes.Internal || !strings.Contains(err.Error(), expectedInvalidHeaderField) {
 		t.Fatalf("Read got error %v, want error with code %v and contains %q", err, codes.Internal, expectedInvalidHeaderField)
 	}
-	ct.Close()
+	ct.Close(errSelfCloseForTest)
 	server.stop()
 }
 
 func TestHeaderChanClosedAfterReceivingAnInvalidHeader(t *testing.T) {
 	server, ct := setUp(t, 0, math.MaxUint32, invalidHeaderField)
 	defer server.stop()
-	defer ct.Close()
+	defer ct.Close(errSelfCloseForTest)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	s, err := ct.NewStream(ctx, &CallHdr{Host: "localhost", Method: "foo"})
 	if err != nil {
-		t.Fatalf("failed to create the stream")
+		t.Fatalf("%s", "failed to create the stream")
 	}
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	select {
 	case <-s.headerChan:
 	case <-timer.C:
-		t.Errorf("s.headerChan: got open, want closed")
+		t.Errorf("%s", "s.headerChan: got open, want closed")
 	}
 }
 
@@ -1596,7 +1693,7 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig)
 	}
 	server, client := setUpWithOptions(t, 0, sc, pingpong, co)
 	defer server.stop()
-	defer client.Close()
+	defer client.Close(errSelfCloseForTest)
 	waitWhileTrue(t, func() (bool, error) {
 		server.mu.Lock()
 		defer server.mu.Unlock()
@@ -1678,7 +1775,7 @@ func testFlowControlAccountCheck(t *testing.T, msgSize int, wc windowSizeConfig)
 	}
 	// Close down both server and client so that their internals can be read without data
 	// races.
-	client.Close()
+	client.Close(errSelfCloseForTest)
 	st.Close()
 	<-st.readerDone
 	<-st.writerDone
@@ -1717,7 +1814,7 @@ func waitWhileTrue(t *testing.T, condition func() (bool, error)) {
 		if wait {
 			select {
 			case <-timer.C:
-				t.Fatalf(err.Error())
+				t.Fatalf("%s", err.Error())
 			default:
 				time.Sleep(50 * time.Millisecond)
 				continue
@@ -1877,7 +1974,7 @@ func TestPingPong1MB(t *testing.T) {
 func runPingPongTest(t *testing.T, msgSize int) {
 	server, client := setUp(t, 0, 0, pingpong)
 	defer server.stop()
-	defer client.Close()
+	defer client.Close(errSelfCloseForTest)
 	waitWhileTrue(t, func() (bool, error) {
 		server.mu.Lock()
 		defer server.mu.Unlock()
@@ -1898,33 +1995,26 @@ func runPingPongTest(t *testing.T, msgSize int) {
 	binary.BigEndian.PutUint32(outgoingHeader[1:], uint32(msgSize))
 	opts := &Options{}
 	incomingHeader := make([]byte, 5)
-	done := make(chan struct{})
-	go func() {
-		timer := time.NewTimer(time.Second * 1)
-		<-timer.C
-		close(done)
-	}()
-	for {
-		select {
-		case <-done:
-			client.Write(stream, nil, nil, &Options{Last: true})
-			if _, err := stream.Read(incomingHeader); err != io.EOF {
-				t.Fatalf("Client expected EOF from the server. Got: %v", err)
-			}
-			return
-		default:
-			if err := client.Write(stream, outgoingHeader, msg, opts); err != nil {
-				t.Fatalf("Error on client while writing message. Err: %v", err)
-			}
-			if _, err := stream.Read(incomingHeader); err != nil {
-				t.Fatalf("Error on client while reading data header. Err: %v", err)
-			}
-			sz := binary.BigEndian.Uint32(incomingHeader[1:])
-			recvMsg := make([]byte, int(sz))
-			if _, err := stream.Read(recvMsg); err != nil {
-				t.Fatalf("Error on client while reading data. Err: %v", err)
-			}
+
+	ctx, cancel = context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	for ctx.Err() == nil {
+		if err := client.Write(stream, outgoingHeader, msg, opts); err != nil {
+			t.Fatalf("Error on client while writing message. Err: %v", err)
 		}
+		if _, err := stream.Read(incomingHeader); err != nil {
+			t.Fatalf("Error on client while reading data header. Err: %v", err)
+		}
+		sz := binary.BigEndian.Uint32(incomingHeader[1:])
+		recvMsg := make([]byte, int(sz))
+		if _, err := stream.Read(recvMsg); err != nil {
+			t.Fatalf("Error on client while reading data. Err: %v", err)
+		}
+	}
+
+	client.Write(stream, nil, nil, &Options{Last: true})
+	if _, err := stream.Read(incomingHeader); err != io.EOF {
+		t.Fatalf("Client expected EOF from the server. Got: %v", err)
 	}
 }
 
@@ -1964,7 +2054,7 @@ func TestHeaderTblSize(t *testing.T) {
 	}()
 
 	server, ct := setUp(t, 0, math.MaxUint32, normal)
-	defer ct.Close()
+	defer ct.Close(errSelfCloseForTest)
 	defer server.stop()
 	ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer ctxCancel()
@@ -1986,7 +2076,7 @@ func TestHeaderTblSize(t *testing.T) {
 		continue
 	}
 	if i == 1000 {
-		t.Fatalf("unable to create any server transport after 10s")
+		t.Fatalf("%s", "unable to create any server transport after 10s")
 	}
 
 	for st := range server.conns {
@@ -2013,7 +2103,7 @@ func TestHeaderTblSize(t *testing.T) {
 		break
 	}
 	if i == 1000 {
-		t.Fatalf("expected len(limits) = 1 within 10s, got != 1")
+		t.Fatalf("%s", "expected len(limits) = 1 within 10s, got != 1")
 	}
 
 	ct.controlBuf.put(&outgoingSettings{
@@ -2036,6 +2126,63 @@ func TestHeaderTblSize(t *testing.T) {
 		break
 	}
 	if i == 1000 {
-		t.Fatalf("expected len(limits) = 2 within 10s, got != 2")
+		t.Fatalf("%s", "expected len(limits) = 2 within 10s, got != 2")
 	}
+}
+
+func TestTLSConfig(t *testing.T) {
+	cfg := &tls.Config{}
+	newCfg := TLSConfig(cfg)
+	test.Assert(t, len(cfg.NextProtos) == 0)
+	test.Assert(t, len(newCfg.NextProtos) == 1)
+	test.Assert(t, newCfg.NextProtos[0] == alpnProtoStrH2)
+	test.Assert(t, newCfg.MinVersion == tls.VersionTLS12)
+}
+
+func TestTlsAppendH2ToALPNProtocols(t *testing.T) {
+	var ps []string
+	appended := tlsAppendH2ToALPNProtocols(ps)
+	test.Assert(t, len(appended) == 1)
+	test.Assert(t, appended[0] == alpnProtoStrH2)
+	appended = tlsAppendH2ToALPNProtocols(appended)
+	test.Assert(t, len(appended) == 1)
+}
+
+func Test_isIgnorable(t *testing.T) {
+	test.Assert(t, !isIgnorable(nil))
+
+	err := connectionErrorfWithIgnorable(true, nil, "ignorable")
+	test.Assert(t, isIgnorable(err))
+
+	err = connectionErrorf(true, nil, "not ignorable")
+	test.Assert(t, !isIgnorable(err))
+
+	test.Assert(t, isIgnorable(ErrConnClosing))
+}
+
+func Test_closeStreamTask(t *testing.T) {
+	// replace ticker to reduce test time
+	ticker = utils.NewSyncSharedTicker(10 * time.Millisecond)
+	server, ct := setUp(t, 0, math.MaxUint32, cancel)
+	callHdr := &CallHdr{
+		Host:   "localhost",
+		Method: "foo.Small",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := ct.NewStream(ctx, callHdr)
+	if err != nil {
+		t.Fatalf("failed to open stream: %v", err)
+	}
+	cancel()
+	// wait for server receiving RstStream Frame
+	<-server.srvReady
+	state := stream.getState()
+	test.Assert(t, state == streamDone, state)
+	ct.mu.Lock()
+	streamNums := len(ct.activeStreams)
+	ct.mu.Unlock()
+	test.Assert(t, streamNums == 0, streamNums)
+
+	ct.Close(errSelfCloseForTest)
+	server.stop()
 }

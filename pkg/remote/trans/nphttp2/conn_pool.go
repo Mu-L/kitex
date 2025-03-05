@@ -18,13 +18,13 @@ package nphttp2
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cloudwego/netpoll"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/cloudwego/kitex/pkg/klog"
@@ -91,10 +91,10 @@ func (t *transports) put(trans grpc.ClientTransport) {
 }
 
 // close all connections of the pool.
-func (c *transports) close() {
-	for i := range c.cliTransports {
-		if t := c.cliTransports[i]; t != nil {
-			t.GracefulClose()
+func (t *transports) close() {
+	for i := range t.cliTransports {
+		if c := t.cliTransports[i]; c != nil {
+			c.GracefulClose()
 		}
 	}
 }
@@ -108,13 +108,23 @@ func (p *connPool) newTransport(ctx context.Context, dialer remote.Dialer, netwo
 	if err != nil {
 		return nil, err
 	}
+	if opts.TLSConfig != nil {
+		tlsConn, err := newTLSConn(conn, opts.TLSConfig)
+		if err != nil {
+			return nil, err
+		}
+		conn = tlsConn
+	}
 	return grpc.NewClientTransport(
 		ctx,
-		conn.(netpoll.Connection),
+		conn,
 		opts,
 		p.remoteService,
 		func(grpc.GoAwayReason) {
-			// do nothing
+			// remove connection from the pool.
+			// we do not need to close this grpc transport manually
+			// since grpc client is responsible for doing this.
+			p.conns.Delete(address)
 		},
 		func() {
 			// do nothing
@@ -199,6 +209,9 @@ func (p *connPool) createShortConn(ctx context.Context, network, address string,
 
 // Discard implements the ConnPool interface.
 func (p *connPool) Discard(conn net.Conn) error {
+	if p.connOpts.ShortConn {
+		return p.release(conn)
+	}
 	return nil
 }
 
@@ -218,4 +231,13 @@ func (p *connPool) Close() error {
 		return true
 	})
 	return nil
+}
+
+// newTLSConn constructs a client-side TLS connection and performs handshake.
+func newTLSConn(conn net.Conn, tlsCfg *tls.Config) (net.Conn, error) {
+	tlsConn := tls.Client(conn, tlsCfg)
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, err
+	}
+	return tlsConn, nil
 }

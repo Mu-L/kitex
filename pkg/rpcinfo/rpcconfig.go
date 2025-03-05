@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/transport"
 )
 
@@ -64,6 +65,10 @@ type rpcConfig struct {
 	ioBufferSize      int
 	transportProtocol transport.Protocol
 	interactionMode   InteractionMode
+	payloadCodec      serviceinfo.PayloadCodec
+
+	// stream config
+	streamRecvTimeout time.Duration
 }
 
 func init() {
@@ -164,7 +169,13 @@ func (r *rpcConfig) TransportProtocol() transport.Protocol {
 
 // SetTransportProtocol implements MutableRPCConfig interface.
 func (r *rpcConfig) SetTransportProtocol(tp transport.Protocol) error {
-	r.transportProtocol |= tp
+	// PurePayload would override all the bits set before
+	// since in previous implementation, r.transport |= transport.PurePayload would not take effect
+	if tp == transport.PurePayload {
+		r.transportProtocol = tp
+	} else {
+		r.transportProtocol |= tp
+	}
 	return nil
 }
 
@@ -175,6 +186,22 @@ func (r *rpcConfig) SetInteractionMode(mode InteractionMode) error {
 
 func (r *rpcConfig) InteractionMode() InteractionMode {
 	return r.interactionMode
+}
+
+func (r *rpcConfig) SetPayloadCodec(codec serviceinfo.PayloadCodec) {
+	r.payloadCodec = codec
+}
+
+func (r *rpcConfig) PayloadCodec() serviceinfo.PayloadCodec {
+	return r.payloadCodec
+}
+
+func (r *rpcConfig) SetStreamRecvTimeout(timeout time.Duration) {
+	r.streamRecvTimeout = timeout
+}
+
+func (r *rpcConfig) StreamRecvTimeout() time.Duration {
+	return r.streamRecvTimeout
 }
 
 // Clone returns a copy of the current rpcConfig.

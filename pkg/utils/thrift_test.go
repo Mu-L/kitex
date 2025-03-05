@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 CloudWeGo Authors
+ * Copyright 2024 CloudWeGo Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,98 +20,85 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/cloudwego/gopkg/bufiox"
+	"github.com/cloudwego/gopkg/protocol/thrift"
+	"github.com/cloudwego/gopkg/protocol/thrift/apache"
 
-	mt "github.com/cloudwego/kitex/internal/mocks/thrift"
 	"github.com/cloudwego/kitex/internal/test"
 )
 
-func TestRPCCodec(t *testing.T) {
-	rc := NewThriftMessageCodec()
+func TestThriftMessageCodec(t *testing.T) {
+	apache.RegisterCheckTStruct(func(data interface{}) error {
+		_, ok := data.(thrift.FastCodec)
+		if ok {
+			return nil
+		}
+		return errors.New("not thrift.FastCodec")
+	})
+	apache.RegisterThriftRead(func(in bufiox.Reader, v interface{}) error {
+		msg := v.(thrift.FastCodec)
+		sd := thrift.NewSkipDecoder(in)
+		buf, err := sd.Next(thrift.STRUCT)
+		if err != nil {
+			return err
+		}
+		_, err = msg.FastRead(buf)
+		return err
+	})
+	apache.RegisterThriftWrite(func(out bufiox.Writer, v interface{}) error {
+		msg := v.(thrift.FastCodec)
+		buf, err := out.Malloc(msg.BLength())
+		if err != nil {
+			return err
+		}
+		_ = msg.FastWriteNocopy(buf, nil)
+		return nil
+	})
+	defer func() {
+		apache.RegisterCheckTStruct(nil)
+		apache.RegisterThriftRead(nil)
+		apache.RegisterThriftWrite(nil)
+	}()
 
-	req1 := mt.NewMockReq()
-	req1.Msg = "Hello Kitex"
-	strMap := make(map[string]string)
-	strMap["aa"] = "aa"
-	strMap["bb"] = "bb"
-	req1.StrMap = strMap
+	ex := thrift.NewApplicationException(1, "hello")
 
-	args1 := mt.NewMockTestArgs()
-	args1.Req = req1
-
-	// encode
-	buf, err := rc.Encode("mockMethod", thrift.CALL, 100, args1)
+	// Encode, Decode
+	x := ThriftMessageCodec{}
+	b, err := x.Encode("testmethod", thrift.CALL, 99, ex)
 	test.Assert(t, err == nil, err)
-
-	var argsDecode1 mt.MockTestArgs
-	// decode
-	method, seqID, err := rc.Decode(buf, &argsDecode1)
-
-	test.Assert(t, err == nil)
-	test.Assert(t, method == "mockMethod")
-	test.Assert(t, seqID == 100)
-	test.Assert(t, argsDecode1.Req.Msg == req1.Msg)
-	test.Assert(t, len(argsDecode1.Req.StrMap) == len(req1.StrMap))
-	for k := range argsDecode1.Req.StrMap {
-		test.Assert(t, argsDecode1.Req.StrMap[k] == req1.StrMap[k])
-	}
-
-	// *** reuse ThriftMessageCodec
-	req2 := mt.NewMockReq()
-	req2.Msg = "Hello Kitex1"
-	strMap = make(map[string]string)
-	strMap["cc"] = "cc"
-	strMap["dd"] = "dd"
-	req2.StrMap = strMap
-	args2 := mt.NewMockTestArgs()
-	args2.Req = req2
-	// encode
-	buf, err = rc.Encode("mockMethod1", thrift.CALL, 101, args2)
+	p := thrift.NewApplicationException(0, "")
+	method, seq, err := x.Decode(b, p)
 	test.Assert(t, err == nil, err)
+	test.Assert(t, "testmethod" == method)
+	test.Assert(t, int32(99) == seq)
+	test.Assert(t, ex.Msg() == p.Msg())
+	test.Assert(t, ex.TypeID() == p.TypeID())
 
-	// decode
-	var argsDecode2 mt.MockTestArgs
-	method, seqID, err = rc.Decode(buf, &argsDecode2)
-
+	// Encode, Decode (thrift.EXCEPTION)
+	b, err = x.Encode("testmethod", thrift.EXCEPTION, 99, ex)
 	test.Assert(t, err == nil, err)
-	test.Assert(t, method == "mockMethod1")
-	test.Assert(t, seqID == 101)
-	test.Assert(t, argsDecode2.Req.Msg == req2.Msg)
-	test.Assert(t, len(argsDecode2.Req.StrMap) == len(req2.StrMap))
-	for k := range argsDecode2.Req.StrMap {
-		test.Assert(t, argsDecode2.Req.StrMap[k] == req2.StrMap[k])
-	}
+	method, seq, err = x.Decode(b, nil)
+	test.Assert(t, err != nil)
+	ex, ok := err.(*thrift.ApplicationException)
+	test.Assert(t, ok)
+	test.Assert(t, ex.Msg() == p.Msg())
+	test.Assert(t, ex.TypeID() == p.TypeID())
+	test.Assert(t, "testmethod" == method)
+	test.Assert(t, int32(99) == seq)
+
+	// Serialize, Deserialize
+	b, err = x.Serialize(ex)
+	test.Assert(t, err == nil, err)
+	p = thrift.NewApplicationException(0, "")
+	x.Deserialize(p, b)
+	test.Assert(t, err == nil, err)
+	test.Assert(t, ex.Msg() == p.Msg())
+	test.Assert(t, ex.TypeID() == p.TypeID())
 }
 
-func TestSerializer(t *testing.T) {
-	rc := NewThriftMessageCodec()
-
-	req := mt.NewMockReq()
-	req.Msg = "Hello Kitex"
-	strMap := make(map[string]string)
-	strMap["aa"] = "aa"
-	strMap["bb"] = "bb"
-	req.StrMap = strMap
-
-	args := mt.NewMockTestArgs()
-	args.Req = req
-
-	b, err := rc.Serialize(args)
-	test.Assert(t, err == nil, err)
-
-	var args2 mt.MockTestArgs
-	err = rc.Deserialize(&args2, b)
-	test.Assert(t, err == nil, err)
-
-	test.Assert(t, args2.Req.Msg == req.Msg)
-	test.Assert(t, len(args2.Req.StrMap) == len(req.StrMap))
-	for k := range args2.Req.StrMap {
-		test.Assert(t, args2.Req.StrMap[k] == req.StrMap[k])
-	}
-}
-
-func TestException(t *testing.T) {
-	errMsg := "my error"
-	b := MarshalError("some method", errors.New(errMsg))
-	test.Assert(t, UnmarshalError(b).Error() == errMsg)
+func TestMarshalError(t *testing.T) {
+	err := errors.New("testing")
+	b := MarshalError("testmethod", err)
+	err2 := UnmarshalError(b)
+	test.Assert(t, err.Error() == err2.Error())
 }

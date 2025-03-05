@@ -20,6 +20,7 @@ import (
 	"io"
 	"net"
 
+	"github.com/bytedance/gopkg/lang/dirtmake"
 	"github.com/cloudwego/netpoll"
 	"golang.org/x/net/http2/hpack"
 
@@ -34,8 +35,8 @@ type framer struct {
 
 func newFramer(conn net.Conn, writeBufferSize, readBufferSize, maxHeaderListSize uint32) *framer {
 	var r netpoll.Reader
-	if npconn, ok := conn.(netpoll.Connection); ok {
-		r = npconn.Reader()
+	if npConn, ok := conn.(interface{ Reader() netpoll.Reader }); ok {
+		r = npConn.Reader()
 	} else {
 		r = netpoll.NewReader(conn)
 	}
@@ -64,7 +65,7 @@ type bufWriter struct {
 
 func newBufWriter(writer io.Writer, batchSize int) *bufWriter {
 	return &bufWriter{
-		buf:       make([]byte, batchSize*2),
+		buf:       dirtmake.Bytes(batchSize*2, batchSize*2),
 		batchSize: batchSize,
 		writer:    writer,
 	}

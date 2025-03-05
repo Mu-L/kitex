@@ -52,7 +52,11 @@ func newBufferReadWriter() interface{} {
 // NewBufferReader creates a new remote.ByteBuffer using the given netpoll.ZeroCopyReader.
 func NewBufferReader(ir io.Reader) remote.ByteBuffer {
 	rw := rwPool.Get().(*bufferReadWriter)
-	rw.reader = netpoll.NewReader(ir)
+	if npReader, ok := ir.(interface{ Reader() netpoll.Reader }); ok {
+		rw.reader = npReader.Reader()
+	} else {
+		rw.reader = netpoll.NewReader(ir)
+	}
 	rw.ioReader = ir
 	rw.status = remote.BitReadable
 	rw.readSize = 0
@@ -128,13 +132,17 @@ func (rw *bufferReadWriter) ReadString(n int) (s string, err error) {
 	return
 }
 
-func (rw *bufferReadWriter) ReadBinary(n int) (p []byte, err error) {
+func (rw *bufferReadWriter) ReadBinary(p []byte) (n int, err error) {
 	if !rw.readable() {
-		return p, errors.New("unreadable buffer, cannot support ReadBinary")
+		return 0, errors.New("unreadable buffer, cannot support ReadBinary")
 	}
-	if p, err = rw.reader.ReadBinary(n); err == nil {
-		rw.readSize += n
+	n = len(p)
+	var buf []byte
+	if buf, err = rw.reader.Next(n); err != nil {
+		return 0, err
 	}
+	copy(p, buf)
+	rw.readSize += n
 	return
 }
 
@@ -159,7 +167,7 @@ func (rw *bufferReadWriter) Malloc(n int) (buf []byte, err error) {
 	return rw.writer.Malloc(n)
 }
 
-func (rw *bufferReadWriter) MallocLen() (length int) {
+func (rw *bufferReadWriter) WrittenLen() (length int) {
 	if !rw.writable() {
 		return -1
 	}

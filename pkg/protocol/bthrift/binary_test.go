@@ -17,15 +17,12 @@
 package bthrift
 
 import (
+	"encoding/binary"
 	"fmt"
 	"testing"
 
-	"github.com/apache/thrift/lib/go/thrift"
-	"github.com/cloudwego/netpoll"
-
-	"github.com/cloudwego/kitex/internal/test"
-	"github.com/cloudwego/kitex/pkg/remote"
-	internalnetpoll "github.com/cloudwego/kitex/pkg/remote/trans/netpoll"
+	thrift "github.com/cloudwego/kitex/pkg/protocol/bthrift/apache"
+	"github.com/cloudwego/kitex/pkg/protocol/bthrift/internal/test"
 )
 
 // TestWriteMessageEnd test binary WriteMessageEnd function
@@ -318,9 +315,7 @@ func TestWriteStringNocopy(t *testing.T) {
 	buf := make([]byte, 128)
 	exceptWs := "0000000c6d657373616765426567696e"
 	exceptSize := 16
-	out := internalnetpoll.NewReaderWriterByteBuffer(netpoll.NewLinkBuffer(0))
-	nw, _ := out.(remote.NocopyWrite)
-	wn := Binary.WriteStringNocopy(buf, nw, "messageBegin")
+	wn := Binary.WriteStringNocopy(buf, nil, "messageBegin")
 	ws := fmt.Sprintf("%x", buf[:wn])
 	test.Assert(t, wn == exceptSize, wn, exceptSize)
 	test.Assert(t, ws == exceptWs, ws, exceptWs)
@@ -331,9 +326,7 @@ func TestWriteBinaryNocopy(t *testing.T) {
 	buf := make([]byte, 128)
 	exceptWs := "0000000c6d657373616765426567696e"
 	exceptSize := 16
-	out := internalnetpoll.NewReaderWriterByteBuffer(netpoll.NewLinkBuffer(0))
-	nw, _ := out.(remote.NocopyWrite)
-	wn := Binary.WriteBinaryNocopy(buf, nw, []byte("messageBegin"))
+	wn := Binary.WriteBinaryNocopy(buf, nil, []byte("messageBegin"))
 	ws := fmt.Sprintf("%x", buf[:wn])
 	test.Assert(t, wn == exceptSize, wn, exceptSize)
 	test.Assert(t, ws == exceptWs, ws, exceptWs)
@@ -533,4 +526,29 @@ func TestSkip(t *testing.T) {
 	offset += size
 	_, valSet, _, _ := Binary.ReadSetBegin(buf[offset:])
 	test.Assert(t, valSet == 11)
+}
+
+func BenchmarkBinaryProtocolReadString(b *testing.B) {
+	stringSizes := []int{64, 128, 1024, 4096, 10240, 102400}
+	strings := 32
+	for _, sz := range stringSizes {
+		b.Run(fmt.Sprintf("string_size=%d", sz), func(b *testing.B) {
+			stringBuffer := make([]byte, sz*strings+4*strings)
+			start := 0
+			for i := 0; i < strings; i++ {
+				binary.BigEndian.PutUint32(stringBuffer[start:start+4], uint32(sz))
+				start += sz + 4
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for i := 0; i < strings; i++ {
+					_, l, err := Binary.ReadString(stringBuffer)
+					if l-4 != sz || err != nil {
+						b.Fatal("read string failed", l, err)
+					}
+				}
+			}
+		})
+	}
 }

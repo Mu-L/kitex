@@ -70,6 +70,14 @@ const (
 	waitReadFinish
 	writeStart
 	writeFinish
+	streamRecv
+	streamSend
+	checksumGenerateStart
+	checksumGenerateFinish
+	checksumValidateStart
+	checksumValidateFinish
+
+	// NOTE: add new events before this line
 	predefinedEventNum
 )
 
@@ -78,16 +86,24 @@ var (
 	RPCStart  = newEvent(rpcStart, LevelBase)
 	RPCFinish = newEvent(rpcFinish, LevelBase)
 
-	ServerHandleStart  = newEvent(serverHandleStart, LevelDetailed)
-	ServerHandleFinish = newEvent(serverHandleFinish, LevelDetailed)
-	ClientConnStart    = newEvent(clientConnStart, LevelDetailed)
-	ClientConnFinish   = newEvent(clientConnFinish, LevelDetailed)
-	ReadStart          = newEvent(readStart, LevelDetailed)
-	ReadFinish         = newEvent(readFinish, LevelDetailed)
-	WaitReadStart      = newEvent(waitReadStart, LevelDetailed)
-	WaitReadFinish     = newEvent(waitReadFinish, LevelDetailed)
-	WriteStart         = newEvent(writeStart, LevelDetailed)
-	WriteFinish        = newEvent(writeFinish, LevelDetailed)
+	ServerHandleStart      = newEvent(serverHandleStart, LevelDetailed)
+	ServerHandleFinish     = newEvent(serverHandleFinish, LevelDetailed)
+	ClientConnStart        = newEvent(clientConnStart, LevelDetailed)
+	ClientConnFinish       = newEvent(clientConnFinish, LevelDetailed)
+	ReadStart              = newEvent(readStart, LevelDetailed)
+	ReadFinish             = newEvent(readFinish, LevelDetailed)
+	WaitReadStart          = newEvent(waitReadStart, LevelDetailed)
+	WaitReadFinish         = newEvent(waitReadFinish, LevelDetailed)
+	WriteStart             = newEvent(writeStart, LevelDetailed)
+	WriteFinish            = newEvent(writeFinish, LevelDetailed)
+	ChecksumValidateStart  = newEvent(checksumValidateStart, LevelDetailed)
+	ChecksumValidateFinish = newEvent(checksumValidateFinish, LevelDetailed)
+	ChecksumGenerateStart  = newEvent(checksumGenerateStart, LevelDetailed)
+	ChecksumGenerateFinish = newEvent(checksumGenerateFinish, LevelDetailed)
+
+	// Streaming Events
+	StreamRecv = newEvent(streamRecv, LevelDetailed)
+	StreamSend = newEvent(streamSend, LevelDetailed)
 )
 
 // errors
@@ -131,6 +147,11 @@ func MaxEventNum() int {
 	lock.RLock()
 	defer lock.RUnlock()
 	return maxEventNum
+}
+
+// PredefinedEventNum returns the number of predefined events of kitex.
+func PredefinedEventNum() int {
+	return int(predefinedEventNum)
 }
 
 func newEvent(idx EventIndex, level Level) Event {

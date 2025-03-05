@@ -20,11 +20,13 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/cloudwego/kitex/pkg/kerrors"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/transmeta"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/utils"
 	"github.com/cloudwego/kitex/transport"
 )
@@ -69,8 +71,39 @@ func (ch *clientTTHeaderHandler) WriteMeta(ctx context.Context, msg remote.Messa
 		hd[transmeta.TransportType] = unframedTransportType
 	}
 
+	cfg := rpcinfo.AsMutableRPCConfig(ri.Config())
+	if cfg.IsRPCTimeoutLocked() {
+		hd[transmeta.RPCTimeout] = strconv.Itoa(int(ri.Config().RPCTimeout().Milliseconds()))
+	}
+	if cfg.IsConnectTimeoutLocked() {
+		hd[transmeta.ConnectTimeout] = strconv.Itoa(int(ri.Config().ConnectTimeout().Milliseconds()))
+	}
 	transInfo.PutTransIntInfo(hd)
+	if idlSvcName := getIDLSvcName(msg.ServiceInfo(), ri); idlSvcName != "" {
+		if strInfo := transInfo.TransStrInfo(); strInfo != nil {
+			strInfo[transmeta.HeaderIDLServiceName] = idlSvcName
+		} else {
+			transInfo.PutTransStrInfo(map[string]string{transmeta.HeaderIDLServiceName: idlSvcName})
+		}
+	}
 	return ctx, nil
+}
+
+func getIDLSvcName(svcInfo *serviceinfo.ServiceInfo, ri rpcinfo.RPCInfo) string {
+	idlSvcName := ri.Invocation().ServiceName()
+	// for combine service, idlSvcName may not be the same as server's service name
+	var isCombineService bool
+	if svcInfo != nil {
+		val, exists := svcInfo.Extra["combine_service"]
+		if exists {
+			isCombineService, _ = val.(bool)
+		}
+	}
+	// generic service name shouldn't be written to header
+	if idlSvcName != serviceinfo.GenericService && !isCombineService {
+		return idlSvcName
+	}
+	return ""
 }
 
 // ReadMeta of clientTTHeaderHandler reads headers of TTHeader protocol from transport
@@ -82,20 +115,34 @@ func (ch *clientTTHeaderHandler) ReadMeta(ctx context.Context, msg remote.Messag
 	transInfo := msg.TransInfo()
 	strInfo := transInfo.TransStrInfo()
 
-	if code, err := strconv.Atoi(strInfo[bizStatus]); err == nil && code != 0 {
-		if setter, ok := ri.Invocation().(rpcinfo.InvocationSetter); ok {
-			if bizExtra := strInfo[bizExtra]; bizExtra != "" {
-				extra, err := utils.JSONStr2Map(bizExtra)
-				if err != nil {
-					return ctx, fmt.Errorf("malformed header info, extra: %s", bizExtra)
-				}
-				setter.SetBizStatusErr(kerrors.NewBizStatusErrorWithExtra(int32(code), strInfo[bizMessage], extra))
-			} else {
-				setter.SetBizStatusErr(kerrors.NewBizStatusError(int32(code), strInfo[bizMessage]))
-			}
+	bizErr, err := ParseBizStatusErr(strInfo)
+	if err != nil {
+		return ctx, err
+	}
+	if setter, ok := ri.Invocation().(rpcinfo.InvocationSetter); ok && bizErr != nil {
+		setter.SetBizStatusErr(bizErr)
+	}
+	if val, ok := strInfo[transmeta.HeaderConnectionReadyToReset]; ok {
+		if ei := rpcinfo.AsTaggable(ri.To()); ei != nil {
+			ei.SetTag(rpcinfo.ConnResetTag, val)
 		}
 	}
 	return ctx, nil
+}
+
+func ParseBizStatusErr(strInfo map[string]string) (kerrors.BizStatusErrorIface, error) {
+	if code, err := strconv.ParseInt(strInfo[bizStatus], 10, 32); err == nil && code != 0 {
+		if bizExtra := strInfo[bizExtra]; bizExtra != "" {
+			extra, err := utils.JSONStr2Map(bizExtra)
+			if err != nil {
+				return nil, fmt.Errorf("malformed header info, extra: %s", bizExtra)
+			}
+			return kerrors.NewBizStatusErrorWithExtra(int32(code), strInfo[bizMessage], extra), nil
+		} else {
+			return kerrors.NewBizStatusError(int32(code), strInfo[bizMessage]), nil
+		}
+	}
+	return nil, nil
 }
 
 // serverTTHeaderHandler implement remote.MetaHandler
@@ -119,6 +166,13 @@ func (sh *serverTTHeaderHandler) ReadMeta(ctx context.Context, msg remote.Messag
 			ci.SetMethod(v)
 		}
 	}
+
+	if cfg := rpcinfo.AsMutableRPCConfig(ri.Config()); cfg != nil {
+		timeout := intInfo[transmeta.RPCTimeout]
+		if timeoutMS, err := strconv.Atoi(timeout); err == nil {
+			cfg.SetRPCTimeout(time.Duration(timeoutMS) * time.Millisecond)
+		}
+	}
 	return ctx, nil
 }
 
@@ -140,6 +194,9 @@ func (sh *serverTTHeaderHandler) WriteMeta(ctx context.Context, msg remote.Messa
 		if len(bizErr.BizExtra()) != 0 {
 			strInfo[bizExtra], _ = utils.Map2JSONStr(bizErr.BizExtra())
 		}
+	}
+	if val, ok := ri.To().Tag(rpcinfo.ConnResetTag); ok {
+		strInfo[transmeta.HeaderConnectionReadyToReset] = val
 	}
 
 	return ctx, nil

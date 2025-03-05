@@ -23,10 +23,10 @@ import (
 	"net"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/netpoll"
 
-	stats2 "github.com/cloudwego/kitex/internal/stats"
 	"github.com/cloudwego/kitex/pkg/endpoint"
 	"github.com/cloudwego/kitex/pkg/gofunc"
 	"github.com/cloudwego/kitex/pkg/kerrors"
@@ -40,6 +40,8 @@ import (
 	"github.com/cloudwego/kitex/pkg/stats"
 	"github.com/cloudwego/kitex/transport"
 )
+
+const defaultExitWaitGracefulShutdownTime = 1 * time.Second
 
 type svrTransHandlerFactory struct{}
 
@@ -61,14 +63,15 @@ func (f *svrTransHandlerFactory) NewTransHandler(opt *remote.ServerOption) (remo
 
 func newSvrTransHandler(opt *remote.ServerOption) (*svrTransHandler, error) {
 	svrHdlr := &svrTransHandler{
-		opt:     opt,
-		codec:   opt.Codec,
-		svcInfo: opt.SvcInfo,
-		ext:     np.NewNetpollConnExtension(),
+		opt:           opt,
+		codec:         opt.Codec,
+		svcSearcher:   opt.SvcSearcher,
+		targetSvcInfo: opt.TargetSvcInfo,
+		ext:           np.NewNetpollConnExtension(),
 	}
 	if svrHdlr.opt.TracerCtl == nil {
 		// init TraceCtl when it is nil, or it will lead some unit tests panic
-		svrHdlr.opt.TracerCtl = &stats2.Controller{}
+		svrHdlr.opt.TracerCtl = &rpcinfo.TraceController{}
 	}
 	svrHdlr.funcPool.New = func() interface{} {
 		fs := make([]func(), 0, 64) // 64 is defined casually, no special meaning
@@ -80,30 +83,35 @@ func newSvrTransHandler(opt *remote.ServerOption) (*svrTransHandler, error) {
 var _ remote.ServerTransHandler = &svrTransHandler{}
 
 type svrTransHandler struct {
-	opt        *remote.ServerOption
-	svcInfo    *serviceinfo.ServiceInfo
-	inkHdlFunc endpoint.Endpoint
-	codec      remote.Codec
-	transPipe  *remote.TransPipeline
-	ext        trans.Extension
-	funcPool   sync.Pool
-	conns      sync.Map
-	tasks      sync.WaitGroup
+	opt           *remote.ServerOption
+	svcSearcher   remote.ServiceSearcher
+	targetSvcInfo *serviceinfo.ServiceInfo
+	inkHdlFunc    endpoint.Endpoint
+	codec         remote.Codec
+	transPipe     *remote.TransPipeline
+	ext           trans.Extension
+	funcPool      sync.Pool
+	conns         sync.Map
+	tasks         sync.WaitGroup
 }
 
 // Write implements the remote.ServerTransHandler interface.
 func (t *svrTransHandler) Write(ctx context.Context, conn net.Conn, sendMsg remote.Message) (nctx context.Context, err error) {
 	ri := rpcinfo.GetRPCInfo(ctx)
-	stats2.Record(ctx, ri, stats.WriteStart, nil)
+	rpcinfo.Record(ctx, ri, stats.WriteStart, nil)
 	defer func() {
-		stats2.Record(ctx, ri, stats.WriteFinish, nil)
+		rpcinfo.Record(ctx, ri, stats.WriteFinish, nil)
 	}()
 
-	if methodInfo, _ := trans.GetMethodInfo(ri, t.svcInfo); methodInfo != nil {
-		if methodInfo.OneWay() {
-			return ctx, nil
+	svcInfo := sendMsg.ServiceInfo()
+	if svcInfo != nil {
+		if methodInfo, _ := trans.GetMethodInfo(ri, svcInfo); methodInfo != nil {
+			if methodInfo.OneWay() {
+				return ctx, nil
+			}
 		}
 	}
+
 	wbuf := netpoll.NewLinkBuffer()
 	bufWriter := np.NewWriterByteBuffer(wbuf)
 	err = t.codec.Encode(ctx, sendMsg, bufWriter)
@@ -130,9 +138,9 @@ func (t *svrTransHandler) readWithByteBuffer(ctx context.Context, bufReader remo
 			}
 			bufReader.Release(err)
 		}
-		stats2.Record(ctx, msg.RPCInfo(), stats.ReadFinish, err)
+		rpcinfo.Record(ctx, msg.RPCInfo(), stats.ReadFinish, err)
 	}()
-	stats2.Record(ctx, msg.RPCInfo(), stats.ReadStart, nil)
+	rpcinfo.Record(ctx, msg.RPCInfo(), stats.ReadStart, nil)
 
 	err = t.codec.Decode(ctx, msg, bufReader)
 	if err != nil {
@@ -223,13 +231,15 @@ func (t *svrTransHandler) task(muxSvrConnCtx context.Context, conn net.Conn, rea
 		t.finishTracer(ctx, rpcInfo, err, panicErr)
 		remote.RecycleMessage(recvMsg)
 		remote.RecycleMessage(sendMsg)
-		// reset rpcinfo
-		rpcInfo = t.opt.InitOrResetRPCInfoFunc(rpcInfo, conn.RemoteAddr())
-		muxSvrConn.pool.Put(rpcInfo)
+		// reset rpcinfo for reuse
+		if rpcinfo.PoolEnabled() {
+			rpcInfo = t.opt.InitOrResetRPCInfoFunc(rpcInfo, conn.RemoteAddr())
+			muxSvrConn.pool.Put(rpcInfo)
+		}
 	}()
 
 	// read
-	recvMsg = remote.NewMessageWithNewer(t.svcInfo, rpcInfo, remote.Call, remote.Server)
+	recvMsg = remote.NewMessageWithNewer(t.targetSvcInfo, t.svcSearcher, rpcInfo, remote.Call, remote.Server)
 	bufReader := np.NewReaderByteBuffer(reader)
 	err = t.readWithByteBuffer(ctx, bufReader, recvMsg)
 	if err != nil {
@@ -241,25 +251,30 @@ func (t *svrTransHandler) task(muxSvrConnCtx context.Context, conn net.Conn, rea
 		return
 	}
 
-	var methodInfo serviceinfo.MethodInfo
-	if methodInfo, err = trans.GetMethodInfo(rpcInfo, t.svcInfo); err != nil {
-		closeConn = t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, true)
-		t.OnError(ctx, err, muxSvrConn)
-		return
-	}
-	if methodInfo.OneWay() {
-		sendMsg = remote.NewMessage(nil, t.svcInfo, rpcInfo, remote.Reply, remote.Server)
+	svcInfo := recvMsg.ServiceInfo()
+	if recvMsg.MessageType() == remote.Heartbeat {
+		sendMsg = remote.NewMessage(nil, svcInfo, rpcInfo, remote.Heartbeat, remote.Server)
 	} else {
-		sendMsg = remote.NewMessage(methodInfo.NewResult(), t.svcInfo, rpcInfo, remote.Reply, remote.Server)
-	}
+		var methodInfo serviceinfo.MethodInfo
+		if methodInfo, err = trans.GetMethodInfo(rpcInfo, svcInfo); err != nil {
+			closeConn = t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, true)
+			t.OnError(ctx, err, muxSvrConn)
+			return
+		}
+		if methodInfo.OneWay() {
+			sendMsg = remote.NewMessage(nil, svcInfo, rpcInfo, remote.Reply, remote.Server)
+		} else {
+			sendMsg = remote.NewMessage(methodInfo.NewResult(), svcInfo, rpcInfo, remote.Reply, remote.Server)
+		}
 
-	ctx, err = t.transPipe.OnMessage(ctx, recvMsg, sendMsg)
-	if err != nil {
-		// error cannot be wrapped to print here, so it must exec before NewTransError
-		t.OnError(ctx, err, muxSvrConn)
-		err = remote.NewTransError(remote.InternalError, err)
-		closeConn = t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, false)
-		return
+		ctx, err = t.transPipe.OnMessage(ctx, recvMsg, sendMsg)
+		if err != nil {
+			// error cannot be wrapped to print here, so it must exec before NewTransError
+			t.OnError(ctx, err, muxSvrConn)
+			err = remote.NewTransError(remote.InternalError, err)
+			closeConn = t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, false)
+			return
+		}
 	}
 
 	remote.FillSendMsgFromRecvMsg(recvMsg, sendMsg)
@@ -313,39 +328,66 @@ func (t *svrTransHandler) GracefulShutdown(ctx context.Context) error {
 	iv.SetSeqID(0)
 	ri := rpcinfo.NewRPCInfo(nil, nil, iv, nil, nil)
 	data := NewControlFrame()
-	msg := remote.NewMessage(data, t.svcInfo, ri, remote.Reply, remote.Server)
+	msg := remote.NewMessage(data, nil, ri, remote.Reply, remote.Server)
 	msg.SetProtocolInfo(remote.NewProtocolInfo(transport.TTHeader, serviceinfo.Thrift))
 	msg.TransInfo().TransStrInfo()[transmeta.HeaderConnectionReadyToReset] = "1"
 
-	t.conns.Range(func(k, v interface{}) bool {
-		wbuf := netpoll.NewLinkBuffer()
-		bufWriter := np.NewWriterByteBuffer(wbuf)
-		err := t.codec.Encode(ctx, msg, bufWriter)
-		bufWriter.Release(err)
-		if err == nil {
-			v.(*muxSvrConn).Put(func() (buf netpoll.Writer, isNil bool) {
-				return wbuf, false
-			})
-		} else {
-			c := v.(*muxSvrConn)
-			klog.Warn("KITEX: signal connection closing error:",
-				err.Error(), c.LocalAddr().String(), "=>", c.RemoteAddr().String())
-		}
-		return true
-	})
 	// wait until all notifications are sent and clients stop using those connections
 	done := make(chan struct{})
-	go func() {
+	gofunc.GoFunc(context.Background(), func() {
+		// 1. write control frames to all connections
+		t.conns.Range(func(k, v interface{}) bool {
+			sconn := v.(*muxSvrConn)
+			if !sconn.IsActive() {
+				return true
+			}
+			wbuf := netpoll.NewLinkBuffer()
+			bufWriter := np.NewWriterByteBuffer(wbuf)
+			err := t.codec.Encode(ctx, msg, bufWriter)
+			bufWriter.Release(err)
+			if err == nil {
+				sconn.Put(func() (buf netpoll.Writer, isNil bool) {
+					return wbuf, false
+				})
+			} else {
+				klog.Warn("KITEX: signal connection closing error:",
+					err.Error(), sconn.LocalAddr().String(), "=>", sconn.RemoteAddr().String())
+			}
+			return true
+		})
+		// 2. waiting for all tasks finished
 		t.tasks.Wait()
-		close(done)
-	}()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-done:
-			return nil
+		// 3. waiting for all connections have been shutdown gracefully
+		t.conns.Range(func(k, v interface{}) bool {
+			sconn := v.(*muxSvrConn)
+			if sconn.IsActive() {
+				sconn.GracefulShutdown()
+			}
+			return true
+		})
+		// 4. waiting all crrst packets received by client
+		deadline := time.Now().Add(defaultExitWaitGracefulShutdownTime)
+		ticker := time.NewTicker(defaultExitWaitGracefulShutdownTime / 10)
+		defer ticker.Stop()
+		for now := range ticker.C {
+			active := 0
+			t.conns.Range(func(_, v interface{}) bool {
+				if c := v.(*muxSvrConn); c.IsActive() {
+					active++
+				}
+				return true
+			})
+			if active == 0 || now.After(deadline) {
+				close(done)
+				return
+			}
 		}
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
 	}
 }
 
@@ -383,16 +425,19 @@ func (t *svrTransHandler) SetPipeline(p *remote.TransPipeline) {
 func (t *svrTransHandler) writeErrorReplyIfNeeded(
 	ctx context.Context, recvMsg remote.Message, conn net.Conn, ri rpcinfo.RPCInfo, err error, doOnMessage bool,
 ) (shouldCloseConn bool) {
-	if methodInfo, _ := trans.GetMethodInfo(ri, t.svcInfo); methodInfo != nil {
-		if methodInfo.OneWay() {
-			return
+	svcInfo := recvMsg.ServiceInfo()
+	if svcInfo != nil {
+		if methodInfo, _ := trans.GetMethodInfo(ri, svcInfo); methodInfo != nil {
+			if methodInfo.OneWay() {
+				return
+			}
 		}
 	}
 	transErr, isTransErr := err.(*remote.TransError)
 	if !isTransErr {
 		return
 	}
-	errMsg := remote.NewMessage(transErr, t.svcInfo, ri, remote.Exception, remote.Server)
+	errMsg := remote.NewMessage(transErr, svcInfo, ri, remote.Exception, remote.Server)
 	remote.FillSendMsgFromRecvMsg(recvMsg, errMsg)
 	if doOnMessage {
 		// if error happen before normal OnMessage, exec it to transfer header trans info into rpcinfo

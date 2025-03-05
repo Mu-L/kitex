@@ -92,20 +92,22 @@ func (c *muxCliConn) OnRequest(ctx context.Context, connection netpoll.Connectio
 		crrst := msg.TransInfo().TransStrInfo()[transmeta.HeaderConnectionReadyToReset]
 		if len(crrst) > 0 {
 			// the server is closing this connection
+			// in this case, let server close the real connection
+			// mux cli conn will mark itself is closing but will not close connection.
 			c.closing = true
 			reader.(io.Closer).Close()
 		}
 		return
 	}
-	go func() {
-		asyncCallback, ok := c.seqIDMap.load(seqID)
-		if !ok {
-			reader.(io.Closer).Close()
-			return
-		}
-		bufReader := np.NewReaderByteBuffer(reader)
-		asyncCallback.Recv(bufReader, nil)
-	}()
+
+	// notify asyncCallback
+	callback, ok := c.seqIDMap.load(seqID)
+	if !ok {
+		reader.(io.Closer).Close()
+		return
+	}
+	bufReader := np.NewReaderByteBuffer(reader)
+	callback.Recv(bufReader, nil)
 	return nil
 }
 
@@ -115,6 +117,7 @@ func (c *muxCliConn) Close() error {
 }
 
 func (c *muxCliConn) forceClose() error {
+	c.shardQueue.Close()
 	c.Connection.Close()
 	c.seqIDMap.rangeMap(func(seqID int32, msg EventHandler) {
 		msg.Recv(nil, ErrConnClosed)
@@ -126,6 +129,7 @@ func (c *muxCliConn) close() error {
 	if !c.closing {
 		return c.forceClose()
 	}
+	// if closing, let server close the connection
 	return nil
 }
 
@@ -168,4 +172,8 @@ type muxConn struct {
 // Put puts the buffer getter back to the queue.
 func (c *muxConn) Put(gt mux.WriterGetter) {
 	c.shardQueue.Add(gt)
+}
+
+func (c *muxConn) GracefulShutdown() {
+	c.shardQueue.Close()
 }

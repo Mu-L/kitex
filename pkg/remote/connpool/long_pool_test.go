@@ -22,35 +22,28 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cloudwego/kitex/pkg/connpool"
 
 	"github.com/golang/mock/gomock"
 
 	mocksnetpoll "github.com/cloudwego/kitex/internal/mocks/netpoll"
 	mocksremote "github.com/cloudwego/kitex/internal/mocks/remote"
 	"github.com/cloudwego/kitex/internal/test"
-	"github.com/cloudwego/kitex/pkg/connpool"
 	dialer "github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/utils"
 )
 
 var (
-	mockAddr0 = "127.0.0.1:8000"
-	mockAddr1 = "127.0.0.1:8001"
+	mockDestService = "destService"
+	mockAddr0       = "127.0.0.1:8000"
+	mockAddr1       = "127.0.0.1:8001"
 )
-
-func newLongConnForTest(ctrl *gomock.Controller, addr string) *longConn {
-	conn := mocksnetpoll.NewMockConnection(ctrl)
-	conn.EXPECT().IsActive().Return(true).AnyTimes()
-	conn.EXPECT().Close().AnyTimes()
-
-	return &longConn{
-		Conn:    conn,
-		address: addr,
-	}
-}
 
 func TestPoolReuse(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -246,17 +239,6 @@ func TestPoolDump(t *testing.T) {
 	test.Assert(t, len(dump.ConnsDeadline) == 2)
 }
 
-// fakeNewLongPool creates a LongPool object and modifies it to fit tests.
-func newLongPoolForTest(minPeerAddr, maxPeerAddr, global int, timeout time.Duration) *LongPool {
-	cfg := connpool.IdleConfig{
-		MinIdlePerAddress: minPeerAddr,
-		MaxIdlePerAddress: maxPeerAddr,
-		MaxIdleGlobal:     global,
-		MaxIdleTimeout:    timeout,
-	}
-	return NewLongPool("test", cfg)
-}
-
 func TestLongConnPoolGetTimeout(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -290,9 +272,14 @@ func TestLongConnPoolReuse(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	idleTime := time.Millisecond * 10
+	mockReporter := newMockConnReporter()
+	SetReporter(mockReporter)
+	defer SetReporter(&DummyReporter{}) // reset the reporter to default
+
+	idleTime := time.Millisecond * 100
 	p := newLongPoolForTest(0, 2, 3, idleTime)
 	defer p.Close()
+	p.EnableReporter()
 
 	d := mocksremote.NewMockDialer(ctrl)
 	d.EXPECT().DialTimeout(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(network, address string, timeout time.Duration) (net.Conn, error) {
@@ -305,28 +292,36 @@ func TestLongConnPoolReuse(t *testing.T) {
 	}).AnyTimes()
 
 	addr1, addr2 := mockAddr1, "127.0.0.1:8002"
+	netAddr1 := utils.NewNetAddr("tcp", addr1)
 	opt := dialer.ConnOption{Dialer: d, ConnectTimeout: time.Second}
 
 	count := make(map[net.Conn]int)
-	for i := 0; i < 10; i++ {
+	getCnt := 10
+	for i := 0; i < getCnt; i++ {
 		c, err := p.Get(context.TODO(), "tcp", addr1, opt)
 		test.Assert(t, err == nil)
 		count[c]++
 	}
-	test.Assert(t, len(count) == 10)
+	test.Assert(t, mockReporter.getConnSucceed(mockDestService, netAddr1) == getCnt)
+	test.Assert(t, mockReporter.getReuseSucceed(mockDestService, netAddr1) == 0)
+	mockReporter.reset()
+	test.Assert(t, len(count) == getCnt)
 
 	count = make(map[net.Conn]int)
-	for i := 0; i < 10; i++ {
+	for i := 0; i < getCnt; i++ {
 		c, err := p.Get(context.TODO(), "tcp", addr1, opt)
 		test.Assert(t, err == nil)
 		err = p.Put(c)
 		test.Assert(t, err == nil)
 		count[c]++
 	}
+	// the first Get dial one connection, the following Gets reuse it.
+	test.Assert(t, mockReporter.getConnSucceed(mockDestService, netAddr1) == 1)
+	test.Assert(t, mockReporter.getReuseSucceed(mockDestService, netAddr1) == getCnt-1)
 	test.Assert(t, len(count) == 1)
 
 	count = make(map[net.Conn]int)
-	for i := 0; i < 10; i++ {
+	for i := 0; i < getCnt; i++ {
 		c, err := p.Get(context.TODO(), "tcp", addr1, opt)
 		test.Assert(t, err == nil)
 		err = p.Put(c)
@@ -342,15 +337,19 @@ func TestLongConnPoolReuse(t *testing.T) {
 	test.Assert(t, len(count) == 2)
 
 	// test exceed idleTime
+	mockReporter.reset()
 	count = make(map[net.Conn]int)
-	for i := 0; i < 3; i++ {
+	getCnt = 3
+	for i := 0; i < getCnt; i++ {
+		time.Sleep(idleTime * 3)
 		c, err := p.Get(context.TODO(), "tcp", addr1, opt)
 		test.Assert(t, err == nil)
 		err = p.Put(c)
 		test.Assert(t, err == nil)
 		count[c]++
-		time.Sleep(idleTime * 3)
 	}
+	// Every Get needs dial one connection because old connections cannot be used
+	test.Assert(t, mockReporter.getConnSucceed(mockDestService, netAddr1) == getCnt)
 	test.Assert(t, len(count) == 3)
 }
 
@@ -564,11 +563,11 @@ func TestLongConnPoolCloseOnIdleTimeout(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	idleTime := time.Millisecond
+	idleTime := time.Second
 	p := newLongPoolForTest(0, 2, 5, idleTime)
 	defer p.Close()
 
-	var closed bool
+	var closed uint32 // use atomic to fix data race issue
 	d := mocksremote.NewMockDialer(ctrl)
 	d.EXPECT().DialTimeout(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(network, address string, timeout time.Duration) (net.Conn, error) {
 		na := utils.NewNetAddr(network, address)
@@ -576,10 +575,9 @@ func TestLongConnPoolCloseOnIdleTimeout(t *testing.T) {
 		conn.EXPECT().IsActive().Return(true).AnyTimes()
 		conn.EXPECT().RemoteAddr().Return(na).AnyTimes()
 		conn.EXPECT().Close().DoAndReturn(func() error {
-			if closed {
+			if !atomic.CompareAndSwapUint32(&closed, 0, 1) {
 				return errors.New("connection already closed")
 			}
-			closed = true
 			return nil
 		}).AnyTimes()
 		return conn, nil
@@ -590,18 +588,18 @@ func TestLongConnPoolCloseOnIdleTimeout(t *testing.T) {
 
 	c, err := p.Get(context.TODO(), "tcp", addr, opt)
 	test.Assert(t, err == nil)
-	test.Assert(t, !closed)
+	test.Assert(t, atomic.LoadUint32(&closed) == 0)
 
 	err = p.Put(c)
 	test.Assert(t, err == nil)
-	test.Assert(t, !closed)
+	test.Assert(t, atomic.LoadUint32(&closed) == 0)
 
 	time.Sleep(idleTime * 3)
 
 	c2, err := p.Get(context.TODO(), "tcp", addr, opt)
 	test.Assert(t, err == nil)
 	test.Assert(t, c != c2)
-	test.Assert(t, closed) // the first connection should be closed
+	test.Assert(t, atomic.LoadUint32(&closed) == 1) // the first connection should be closed
 }
 
 func TestLongConnPoolCloseOnClean(t *testing.T) {
@@ -745,6 +743,28 @@ func TestConnPoolClose(t *testing.T) {
 	test.Assert(t, connCount == 0)
 }
 
+func TestClosePoolAndSharedTicker(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	var (
+		poolNum         = 10
+		idleTimeoutUnit = 111 * time.Millisecond
+		pools           = make([]*LongPool, poolNum)
+	)
+	// add new pool with different idleTimeout, increasing the number of shared ticker
+	for i := 0; i < poolNum; i++ {
+		pools[i] = newLongPoolForTest(0, 2, 3, time.Duration(i+1)*idleTimeoutUnit)
+	}
+	// close
+	for i := 0; i < poolNum; i++ {
+		pools[i].Close()
+		// should be removed from shardTickers
+		_, ok := sharedTickers.Load(pools[i])
+		test.Assert(t, !ok)
+	}
+}
+
 func TestLongConnPoolPutUnknownConnection(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -812,8 +832,12 @@ func TestLongConnPoolEvict(t *testing.T) {
 	opt := dialer.ConnOption{Dialer: d, ConnectTimeout: time.Second}
 	// get a new conn
 	var conns []net.Conn
+	aliveconns := int32(maxIdle)
 	for i := 0; i < maxIdle; i++ {
 		c, err := p.Get(context.TODO(), network, address, opt)
+		runtime.SetFinalizer(c, func(_ interface{}) {
+			atomic.AddInt32(&aliveconns, -1)
+		})
 		test.Assert(t, err == nil)
 		conns = append(conns, c)
 	}
@@ -822,6 +846,7 @@ func TestLongConnPoolEvict(t *testing.T) {
 		err := p.Put(conns[i])
 		test.Assert(t, err == nil)
 	}
+	conns = []net.Conn{}
 
 	// only `minIdle` of connections should be kept in the pool
 	// 3 times of idleTime to make sure the eviction goroutine can be done
@@ -831,10 +856,17 @@ func TestLongConnPoolEvict(t *testing.T) {
 		test.Assert(t, v.Len() == minIdle)
 		return true
 	})
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+		if atomic.LoadInt32(&aliveconns) == int32(minIdle) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	test.DeepEqual(t, atomic.LoadInt32(&aliveconns), int32(minIdle))
 	// globalIdle should also be decreased when evicting
 	test.Assert(t, int(p.globalIdle.Now()) == minIdle, p.globalIdle.Now())
 	// get after eviction
-	conns = []net.Conn{}
 	for i := 0; i < maxIdle; i++ {
 		c, err := p.Get(context.TODO(), network, address, opt)
 		test.Assert(t, err == nil)
@@ -967,4 +999,114 @@ func BenchmarkLongPoolGetRand2000Mesh(b *testing.B) {
 			p.Get(context.TODO(), "tcp", addrs[rand.Intn(2000)], opt)
 		}
 	})
+}
+
+// fakeNewLongPool creates a LongPool object and modifies it to fit tests.
+func newLongPoolForTest(minPeerAddr, maxPeerAddr, global int, timeout time.Duration) *LongPool {
+	cfg := connpool.IdleConfig{
+		MinIdlePerAddress: minPeerAddr,
+		MaxIdlePerAddress: maxPeerAddr,
+		MaxIdleGlobal:     global,
+		MaxIdleTimeout:    timeout,
+	}
+	return NewLongPool(mockDestService, cfg)
+}
+
+func newLongConnForTest(ctrl *gomock.Controller, addr string) *longConn {
+	conn := mocksnetpoll.NewMockConnection(ctrl)
+	conn.EXPECT().IsActive().Return(true).AnyTimes()
+	conn.EXPECT().Close().AnyTimes()
+
+	return &longConn{
+		Conn:    conn,
+		address: addr,
+	}
+}
+
+type reportStat struct {
+	reuseSucceed int
+	connSucceed  int
+	connFailed   int
+}
+
+func newMockConnReporter() *mockConnReporter {
+	return &mockConnReporter{stats: make(map[string]*reportStat)}
+}
+
+type mockConnReporter struct {
+	stats map[string]*reportStat // serviceName:addr -> reportStat
+	sync.RWMutex
+}
+
+var _ Reporter = &mockConnReporter{}
+
+func (m *mockConnReporter) ConnSucceed(poolType ConnectionPoolType, serviceName string, addr net.Addr) {
+	m.Lock()
+	defer m.Unlock()
+	key := getKey(serviceName, addr)
+	s, ok := m.stats[key]
+	if !ok {
+		s = &reportStat{}
+	}
+	s.connSucceed++
+	m.stats[key] = s
+}
+
+func (m *mockConnReporter) ConnFailed(poolType ConnectionPoolType, serviceName string, addr net.Addr) {
+	m.Lock()
+	defer m.Unlock()
+	key := getKey(serviceName, addr)
+	s, ok := m.stats[key]
+	if !ok {
+		s = &reportStat{}
+	}
+	s.connFailed++
+	m.stats[key] = s
+}
+
+func (m *mockConnReporter) ReuseSucceed(poolType ConnectionPoolType, serviceName string, addr net.Addr) {
+	m.Lock()
+	defer m.Unlock()
+	key := getKey(serviceName, addr)
+	s, ok := m.stats[key]
+	if !ok {
+		s = &reportStat{}
+	}
+	s.reuseSucceed++
+	m.stats[key] = s
+}
+
+func (m *mockConnReporter) getConnSucceed(serviceName string, addr net.Addr) int {
+	m.RLock()
+	defer m.RUnlock()
+	key := getKey(serviceName, addr)
+	s, ok := m.stats[key]
+	if !ok {
+		return 0
+	}
+	return s.connSucceed
+}
+
+func (m *mockConnReporter) getReuseSucceed(serviceName string, addr net.Addr) int {
+	m.RLock()
+	defer m.RUnlock()
+	key := getKey(serviceName, addr)
+	s, ok := m.stats[key]
+	if !ok {
+		return 0
+	}
+	return s.reuseSucceed
+}
+
+func (m *mockConnReporter) reset() {
+	m.Lock()
+	defer m.Unlock()
+	m.stats = make(map[string]*reportStat)
+}
+
+func getKey(serviceName string, addr net.Addr) string {
+	if addr != nil {
+		return fmt.Sprintf("%s:%s", serviceName, addr.String())
+	}
+	return serviceName
 }

@@ -36,11 +36,16 @@ func TestOnActive(t *testing.T) {
 			},
 		},
 	}
+	pl := remote.NewTransPipeline(svrTransHdlr)
+	svrTransHdlr.SetPipeline(pl)
+	if setter, ok := svrTransHdlr.(remote.InvokeHandleFuncSetter); ok {
+		setter.SetInvokeHandleFunc(func(ctx context.Context, req, resp interface{}) (err error) {
+			return nil
+		})
+	}
 
 	ctx := context.Background()
-	ctx, err := svrTransHdlr.OnActive(ctx, conn)
-	test.Assert(t, err == nil, err)
-	err = svrTransHdlr.OnRead(ctx, conn)
+	_, err := svrTransHdlr.OnActive(ctx, conn)
 	test.Assert(t, err == nil, err)
 }
 
@@ -141,9 +146,9 @@ func TestPanicAfterRead(t *testing.T) {
 	test.Assert(t, err == nil, err)
 
 	err = svrTransHdlr.OnRead(ctx, conn)
-	test.Assert(t, err == nil, err)
+	test.Assert(t, err != nil, err)
 	test.Assert(t, !isInvoked)
-	test.Assert(t, isClosed)
+	test.Assert(t, !isClosed)
 }
 
 // TestNoMethodInfo test server_handler without method info success
@@ -165,7 +170,9 @@ func TestNoMethodInfo(t *testing.T) {
 		},
 	}
 	remote.NewTransPipeline(svrTransHdlr)
-	delete(svrOpt.SvcInfo.Methods, method)
+
+	svcInfo := svrOpt.TargetSvcInfo
+	delete(svcInfo.Methods, method)
 
 	// 2. test
 	ctx := context.Background()
@@ -173,6 +180,6 @@ func TestNoMethodInfo(t *testing.T) {
 	test.Assert(t, err == nil, err)
 
 	err = svrTransHdlr.OnRead(ctx, conn)
-	test.Assert(t, err == nil, err)
-	test.Assert(t, isClosed)
+	test.Assert(t, err != nil, err)
+	test.Assert(t, !isClosed)
 }

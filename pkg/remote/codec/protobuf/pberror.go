@@ -17,8 +17,6 @@
 package protobuf
 
 import (
-	"fmt"
-
 	"google.golang.org/protobuf/proto"
 )
 
@@ -48,7 +46,7 @@ func (p *pbError) IsSetError() bool {
 
 func (p *pbError) Marshal(out []byte) ([]byte, error) {
 	if !p.IsSetError() {
-		return out, fmt.Errorf("no errProto in pbError")
+		return out, nil
 	}
 	return proto.Marshal(p.errProto)
 }

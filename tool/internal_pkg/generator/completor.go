@@ -22,6 +22,8 @@ import (
 	"go/printer"
 	"go/token"
 	"io"
+	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"text/template"
@@ -81,7 +83,7 @@ func (c *completer) compare(pkg *ast.Package) []*MethodInfo {
 			}
 		}
 		if !have {
-			log.Infof("[complete handler] add '%s' to handler.go\n", m.Name)
+			log.Debugf("[complete handler] add '%s' to handler.go\n", m.Name)
 			newMethods = append(newMethods, m)
 		}
 	}
@@ -157,8 +159,10 @@ func (c *completer) process(w io.Writer) error {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, filepath.Dir(c.handlerPath), nil, parser.ParseComments)
 	if err != nil {
-		err = fmt.Errorf("go/parser failed to parse the main package: %w", err)
-		log.Warn("NOTICE: This is not a bug. We cannot add new methods to handler.go because your codes failed to compile. Fix the compile errors and try again.\n%s", err.Error())
+		log.Warnf("This is not a bug. \n"+
+			"We cannot add new methods to handler.go because your codes failed to compile. \n"+
+			"Fix the compile errors and try again.\n"+
+			"go/parser err: %s", err)
 		return err
 	}
 	main, ok := pkgs["main"]
@@ -188,4 +192,179 @@ func (c *completer) CompleteMethods() (*File, error) {
 		return nil, err
 	}
 	return &File{Name: c.handlerPath, Content: buf.String()}, nil
+}
+
+type commonCompleter struct {
+	path   string
+	pkg    *PackageInfo
+	update *Update
+}
+
+func (c *commonCompleter) Complete() (*File, error) {
+	var w bytes.Buffer
+	// get AST of main package
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, c.path, nil, parser.ParseComments)
+	if err != nil {
+		err = fmt.Errorf("go/parser failed to parse the file: %s, err: %v", c.path, err)
+		log.Warnf("NOTICE: This is not a bug. We cannot update the file %s because your codes failed to compile. Fix the compile errors and try again.\n%s", c.path, err.Error())
+		return nil, err
+	}
+
+	newMethods, err := c.compare()
+	if err != nil {
+		return nil, err
+	}
+	if len(newMethods) == 0 {
+		return nil, errNoNewMethod
+	}
+	err = c.addImport(&w, newMethods, fset, f)
+	if err != nil {
+		return nil, fmt.Errorf("add imports failed error: %v", err)
+	}
+	err = c.addImplementations(&w, newMethods)
+	if err != nil {
+		return nil, fmt.Errorf("add implements failed error: %v", err)
+	}
+	return &File{Name: c.path, Content: w.String()}, nil
+}
+
+func (c *commonCompleter) compare() ([]*MethodInfo, error) {
+	var newMethods []*MethodInfo
+	for _, m := range c.pkg.Methods {
+		c.pkg.Methods = []*MethodInfo{m}
+		keyTask := &Task{
+			Text: c.update.Key,
+		}
+		key, err := keyTask.RenderString(c.pkg)
+		if err != nil {
+			return newMethods, err
+		}
+		have := false
+
+		dir := c.path
+		if strings.HasSuffix(c.path, ".go") {
+			dir = path.Dir(c.path)
+		}
+		filepath.Walk(dir, func(fullPath string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if path.Base(dir) == info.Name() && info.IsDir() {
+				return nil
+			}
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			if !strings.HasSuffix(fullPath, ".go") {
+				return nil
+			}
+			// get AST of main package
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, fullPath, nil, parser.ParseComments)
+			if err != nil {
+				err = fmt.Errorf("go/parser failed to parse the file: %s, err: %v", c.path, err)
+				log.Warnf("NOTICE: This is not a bug. We cannot update the file %s because your codes failed to compile. Fix the compile errors and try again.\n%s", c.path, err.Error())
+				return err
+			}
+
+			for _, d := range f.Decls {
+				if fd, ok := d.(*ast.FuncDecl); ok {
+					_, fn := parseFuncDecl(fd)
+					if fn == key {
+						have = true
+						break
+					}
+				}
+			}
+			return nil
+		})
+
+		if !have {
+			newMethods = append(newMethods, m)
+		}
+	}
+
+	return newMethods, nil
+}
+
+// add imports for new methods
+func (c *commonCompleter) addImport(w io.Writer, newMethods []*MethodInfo, fset *token.FileSet, handlerAST *ast.File) error {
+	existImports := make(map[string]bool)
+	for _, i := range handlerAST.Imports {
+		existImports[strings.Trim(i.Path.Value, "\"")] = true
+	}
+	tmp := c.pkg.Methods
+	defer func() {
+		c.pkg.Methods = tmp
+	}()
+	c.pkg.Methods = newMethods
+	for _, i := range c.update.ImportTpl {
+		importTask := &Task{
+			Text: i,
+		}
+		content, err := importTask.RenderString(c.pkg)
+		if err != nil {
+			return err
+		}
+		imports := c.parseImports(content)
+		for idx := range imports {
+			if _, ok := existImports[strings.Trim(imports[idx][1], "\"")]; !ok {
+				astutil.AddImport(fset, handlerAST, strings.Trim(imports[idx][1], "\""))
+			}
+		}
+	}
+	printer.Fprint(w, fset, handlerAST)
+	return nil
+}
+
+func (c *commonCompleter) addImplementations(w io.Writer, newMethods []*MethodInfo) error {
+	tmp := c.pkg.Methods
+	defer func() {
+		c.pkg.Methods = tmp
+	}()
+	c.pkg.Methods = newMethods
+	// generate implements of new methods
+	appendTask := &Task{
+		Text: c.update.AppendTpl,
+	}
+	content, err := appendTask.RenderString(c.pkg)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte(content))
+	c.pkg.Methods = tmp
+	return err
+}
+
+// imports[2] is alias, import
+func (c *commonCompleter) parseImports(content string) (imports [][2]string) {
+	if !strings.Contains(content, "\"") {
+		imports = append(imports, [2]string{"", content})
+		return imports
+	}
+	for i := 0; i < len(content); i++ {
+		if content[i] == ' ' {
+			continue
+		}
+		isAlias := content[i] != '"'
+
+		start := i
+		for ; i < len(content); i++ {
+			if content[i] == ' ' {
+				break
+			}
+		}
+		sub := content[start:i]
+		switch {
+		case isAlias:
+			imports = append(imports, [2]string{sub, ""})
+		case len(imports) > 0 && imports[len(imports)-1][1] == "":
+			imports[len(imports)-1][1] = sub
+		default:
+			imports = append(imports, [2]string{"", sub})
+		}
+	}
+	return imports
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/codec"
 	"github.com/cloudwego/kitex/pkg/remote/codec/perrors"
+	"github.com/cloudwego/kitex/pkg/serviceinfo"
 )
 
 /**
@@ -48,6 +49,12 @@ const (
 // NewProtobufCodec ...
 func NewProtobufCodec() remote.PayloadCodec {
 	return &protobufCodec{}
+}
+
+// IsProtobufCodec checks if the codec is protobufCodec
+func IsProtobufCodec(c remote.PayloadCodec) bool {
+	_, ok := c.(*protobufCodec)
+	return ok
 }
 
 // protobufCodec implements  PayloadMarshaler
@@ -80,8 +87,26 @@ func (c protobufCodec) Marshal(ctx context.Context, message remote.Message, out 
 	}
 
 	// 4. write actual message buf
-	msg, ok := data.(protobufMsgCodec)
+	msg, ok := data.(ProtobufMsgCodec)
 	if !ok {
+		// Generic Case
+		genmsg, isgen := data.(MessageWriterWithContext)
+		if isgen {
+			actualMsg, err := genmsg.WritePb(ctx, methodName)
+			if err != nil {
+				return perrors.NewProtocolErrorWithErrMsg(err, fmt.Sprintf("protobuf marshal message failed: %s", err.Error()))
+			}
+			actualMsgBuf, ok := actualMsg.([]byte)
+			if !ok {
+				return perrors.NewProtocolErrorWithErrMsg(err, fmt.Sprintf("protobuf marshal message failed: %s", err.Error()))
+			}
+			_, err = out.WriteBinary(actualMsgBuf)
+			if err != nil {
+				return perrors.NewProtocolErrorWithMsg(fmt.Sprintf("protobuf marshal, write message buffer failed: %s", err.Error()))
+			}
+			return nil
+		}
+		// return error otherwise
 		return remote.NewTransErrorWithMsg(remote.InvalidProtocol, "encode failed, codec msg type not match with protobufCodec")
 	}
 
@@ -153,15 +178,33 @@ func (c protobufCodec) Unmarshal(ctx context.Context, message remote.Message, in
 		return err
 	}
 	data := message.Data()
+
 	// fast read
 	if msg, ok := data.(fastpb.Reader); ok {
-		_, err := fastpb.ReadMessage(actualMsgBuf, fastpb.SkipTypeCheck, msg)
+		if len(actualMsgBuf) == 0 {
+			// if all fields of a struct is default value, actualMsgLen will be zero and actualMsgBuf will be nil
+			// In the implementation of fastpb, if actualMsgBuf is nil, then fastpb will skip creating this struct, as a result user will get a nil pointer which is not expected.
+			// So, when actualMsgBuf is nil, use default protobuf unmarshal method to decode the struct.
+			// todo: fix fastpb
+		} else {
+			_, err := fastpb.ReadMessage(actualMsgBuf, fastpb.SkipTypeCheck, msg)
+			if err != nil {
+				return remote.NewTransErrorWithMsg(remote.ProtocolError, err.Error())
+			}
+			return nil
+		}
+	}
+
+	// Generic Case
+	if msg, ok := data.(MessageReaderWithMethodWithContext); ok {
+		err := msg.ReadPb(ctx, methodName, actualMsgBuf)
 		if err != nil {
-			return remote.NewTransErrorWithMsg(remote.ProtocolError, err.Error())
+			return err
 		}
 		return nil
 	}
-	msg, ok := data.(protobufMsgCodec)
+
+	msg, ok := data.(ProtobufMsgCodec)
 	if !ok {
 		return remote.NewTransErrorWithMsg(remote.InvalidProtocol, "decode failed, codec msg type not match with protobufCodec")
 	}
@@ -172,10 +215,20 @@ func (c protobufCodec) Unmarshal(ctx context.Context, message remote.Message, in
 }
 
 func (c protobufCodec) Name() string {
-	return "protobuf"
+	return serviceinfo.Protobuf.String()
 }
 
-type protobufMsgCodec interface {
+// MessageWriterWithContext  writes to output bytebuffer
+type MessageWriterWithContext interface {
+	WritePb(ctx context.Context, method string) (interface{}, error)
+}
+
+// MessageReaderWithMethodWithContext read from ActualMsgBuf with method
+type MessageReaderWithMethodWithContext interface {
+	ReadPb(ctx context.Context, method string, in []byte) error
+}
+
+type ProtobufMsgCodec interface {
 	Marshal(out []byte) ([]byte, error)
 	Unmarshal(in []byte) error
 }

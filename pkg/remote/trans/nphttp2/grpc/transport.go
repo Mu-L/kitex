@@ -26,6 +26,7 @@ package grpc
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -232,13 +233,13 @@ const (
 // Stream represents an RPC in the transport layer.
 type Stream struct {
 	id           uint32
-	st           ServerTransport    // nil for client side Stream
-	ct           *http2Client       // nil for server side Stream
-	ctx          context.Context    // the associated context of the stream
-	cancel       context.CancelFunc // always nil for client side Stream
-	done         chan struct{}      // closed at the end of stream to unblock writers. On the client side.
-	ctxDone      <-chan struct{}    // same as done chan but for server side. Cache of ctx.Done() (for performance)
-	method       string             // the associated RPC method of the stream
+	st           ServerTransport  // nil for client side Stream
+	ct           *http2Client     // nil for server side Stream
+	ctx          context.Context  // the associated context of the stream
+	cancel       cancelWithReason // always nil for client side Stream
+	done         chan struct{}    // closed at the end of stream to unblock writers. On the client side.
+	ctxDone      <-chan struct{}  // same as done chan but for server side. Cache of ctx.Done() (for performance)
+	method       string           // the associated RPC method of the stream
 	recvCompress string
 	sendCompress string
 	buf          *recvBuffer
@@ -284,6 +285,11 @@ type Stream struct {
 	// contentSubtype is the content-subtype for requests.
 	// this must be lowercase or the behavior is undefined.
 	contentSubtype string
+
+	// closeStreamErr is used to store the error when stream is closed
+	closeStreamErr atomic.Value
+	// sourceService is the source service name of this stream
+	sourceService string
 }
 
 // isHeaderSent is only valid on the server-side.
@@ -332,6 +338,13 @@ func (s *Stream) waitOnHeader() {
 func (s *Stream) RecvCompress() string {
 	s.waitOnHeader()
 	return s.recvCompress
+}
+
+// SendCompress returns the compression algorithm applied to the outbound
+// message. It is empty string if there is no compression applied.
+func (s *Stream) SendCompress() string {
+	s.waitOnHeader()
+	return s.sendCompress
 }
 
 // SetSendCompress sets the compression algorithm to the stream.
@@ -429,7 +442,7 @@ func (s *Stream) SetHeader(md metadata.MD) error {
 		return ErrIllegalHeaderWrite
 	}
 	s.hdrMu.Lock()
-	s.header = metadata.Join(s.header, md)
+	s.header = metadata.AppendMD(s.header, md)
 	s.hdrMu.Unlock()
 	return nil
 }
@@ -452,7 +465,7 @@ func (s *Stream) SetTrailer(md metadata.MD) error {
 		return ErrIllegalHeaderWrite
 	}
 	s.hdrMu.Lock()
-	s.trailer = metadata.Join(s.trailer, md)
+	s.trailer = metadata.AppendMD(s.trailer, md)
 	s.hdrMu.Unlock()
 	return nil
 }
@@ -471,13 +484,21 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 	return io.ReadFull(s.trReader, p)
 }
 
+func (s *Stream) getCloseStreamErr() error {
+	rawErr := s.closeStreamErr.Load()
+	if rawErr != nil {
+		return rawErr.(error)
+	}
+	return errStatusStreamDone
+}
+
 // StreamWrite only used for unit test
 func StreamWrite(s *Stream, buffer *bytes.Buffer) {
 	s.write(recvMsg{buffer: buffer})
 }
 
 // CreateStream only used for unit test. Create an independent stream out of http2client / http2server
-func CreateStream(id uint32, requestRead func(i int)) *Stream {
+func CreateStream(ctx context.Context, id uint32, requestRead func(i int), method string) *Stream {
 	recvBuffer := newRecvBuffer()
 	trReader := &transportReader{
 		reader: &recvBufferReader{
@@ -491,6 +512,8 @@ func CreateStream(id uint32, requestRead func(i int)) *Stream {
 
 	stream := &Stream{
 		id:          id,
+		ctx:         ctx,
+		method:      method,
 		buf:         recvBuffer,
 		trReader:    trReader,
 		wq:          newWriteQuota(defaultWriteQuota, nil),
@@ -498,6 +521,8 @@ func CreateStream(id uint32, requestRead func(i int)) *Stream {
 		hdrMu:       sync.Mutex{},
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	stream.ctx, stream.cancel = newContextWithCancelReason(ctx, cancel)
 	return stream
 }
 
@@ -578,6 +603,8 @@ type ConnectOptions struct {
 	MaxHeaderListSize *uint32
 	// ShortConn indicates whether the connection will be reused from grpc conn pool
 	ShortConn bool
+	// TLSConfig
+	TLSConfig *tls.Config
 }
 
 // NewServerTransport creates a ServerTransport with conn or non-nil error
@@ -636,7 +663,7 @@ type ClientTransport interface {
 	// Close tears down this transport. Once it returns, the transport
 	// should not be accessed any more. The caller must make sure this
 	// is called only once.
-	Close() error
+	Close(err error) error
 
 	// GracefulClose starts to tear down the transport: the transport will stop
 	// accepting new RPCs and NewStream will return error. Once all streams are
@@ -721,12 +748,21 @@ func connectionErrorf(temp bool, e error, format string, a ...interface{}) Conne
 	}
 }
 
+// connectionErrorfWithIgnorable creates an ConnectionError with the specified error description and isIgnorable == true
+func connectionErrorfWithIgnorable(temp bool, e error, format string, a ...interface{}) ConnectionError {
+	connErr := connectionErrorf(temp, e, format, a...)
+	connErr.isIgnorable = true
+	return connErr
+}
+
 // ConnectionError is an error that results in the termination of the
 // entire connection and the retry of all the active streams.
 type ConnectionError struct {
 	Desc string
 	temp bool
 	err  error
+	// isIgnorable indicates whether this error is triggered by Kitex initiative and could be ignored.
+	isIgnorable bool
 }
 
 func (e ConnectionError) Error() string {
@@ -748,16 +784,38 @@ func (e ConnectionError) Origin() error {
 	return e.err
 }
 
+// Code returns the error code of this connection error to solve the metrics problem(no error code).
+// It always returns codes.Unavailable to be aligned with official gRPC-go.
+func (e ConnectionError) Code() int32 {
+	return int32(codes.Unavailable)
+}
+
+func (e ConnectionError) ignorable() bool {
+	return e.isIgnorable
+}
+
+// isIgnorable checks if the error is ignorable.
+func isIgnorable(rawErr error) bool {
+	if err, ok := rawErr.(ConnectionError); ok {
+		return err.ignorable()
+	}
+	return false
+}
+
 var (
 	// ErrConnClosing indicates that the transport is closing.
-	ErrConnClosing = connectionErrorf(true, nil, "transport is closing")
+	ErrConnClosing = connectionErrorfWithIgnorable(true, nil, "transport is closing")
+
+	// errStreamDone is returned from write at the client side to indicate application
+	// layer of an error.
+	errStreamDone       = errors.New("the stream is done")
+	errStatusStreamDone = status.Err(codes.Internal, errStreamDone.Error())
+
 	// errStreamDrain indicates that the stream is rejected because the
 	// connection is draining. This could be caused by goaway or balancer
 	// removing the address.
-	errStreamDrain = status.New(codes.Unavailable, "the connection is draining").Err()
-	// errStreamDone is returned from write at the client side to indiacte application
-	// layer of an error.
-	errStreamDone = errors.New("the stream is done")
+	errStreamDrain = status.Err(codes.Unavailable, "the connection is draining")
+
 	// StatusGoAway indicates that the server sent a GOAWAY that included this
 	// stream's ID in unprocessed RPCs.
 	statusGoAway = status.New(codes.Unavailable, "the stream is rejected because server is draining the connection")
@@ -785,5 +843,49 @@ func ContextErr(err error) error {
 	case context.Canceled:
 		return status.New(codes.Canceled, err.Error()).Err()
 	}
+	statusErr, ok := err.(*status.Error)
+	if ok { // only returned by contextWithCancelReason
+		return statusErr
+	}
 	return status.Errorf(codes.Internal, "Unexpected error from context packet: %v", err)
 }
+
+// IsStreamDoneErr returns true if the error indicates that the stream is done.
+func IsStreamDoneErr(err error) bool {
+	return errors.Is(err, errStreamDone)
+}
+
+// TLSConfig checks and supplement the tls config provided by user.
+func TLSConfig(tlsConfig *tls.Config) *tls.Config {
+	cfg := tlsConfig.Clone()
+	// When multiple application protocols are supported on a single server-side port number,
+	// the client and the server need to negotiate an application protocol for use with each connection.
+	// For gRPC, "h2" should be appended to "application_layer_protocol_negotiation" field.
+	cfg.NextProtos = tlsAppendH2ToALPNProtocols(cfg.NextProtos)
+
+	// Implementations of HTTP/2 MUST use TLS version 1.2 [TLS12] or higher for HTTP/2 over TLS.
+	// https://datatracker.ietf.org/doc/html/rfc7540#section-9.2
+	if cfg.MinVersion == 0 && (cfg.MaxVersion == 0 || cfg.MaxVersion >= tls.VersionTLS12) {
+		cfg.MinVersion = tls.VersionTLS12
+	}
+	return cfg
+}
+
+const alpnProtoStrH2 = "h2"
+
+func tlsAppendH2ToALPNProtocols(ps []string) []string {
+	for _, p := range ps {
+		if p == alpnProtoStrH2 {
+			return ps
+		}
+	}
+	ret := make([]string, 0, len(ps)+1)
+	ret = append(ret, ps...)
+	return append(ret, alpnProtoStrH2)
+}
+
+var (
+	sendRSTStreamFrameSuffix       = " [send RSTStream Frame]"
+	triggeredByRemoteServiceSuffix = " [triggered by remote service]"
+	triggeredByHandlerSideSuffix   = " [triggered by handler side]"
+)
